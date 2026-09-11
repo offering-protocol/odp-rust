@@ -57,8 +57,9 @@ let suggestions = directory
 `search` returns one page. `continue_search` follows one opaque `next` reference.
 `search_pages` and `search_services` perform bounded traversal for callers that want aggregation.
 Search filters cover keywords, ODP operations, enrollment protocols, payment protocols, payment
-options, and their authentication requirements. Search responses can also carry facets for
-building data-driven filters without packaging the Directory's current vocabulary into the Agent.
+options, trust protocols, and the authentication requirements attached to operations and payments.
+Search responses can also carry facets for building data-driven filters without packaging the
+Directory's current vocabulary into the Agent.
 Each returned Service preserves its enrollment, payment, and trust protocol advertisements.
 Unrecognized protocol descriptors are filtered while recognized descriptors remain strictly
 validated.

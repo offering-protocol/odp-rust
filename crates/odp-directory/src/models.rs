@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use odp_core::{
     AdditionalMembers, AuthenticationRequirement, EnrollmentProtocol, Operation,
-    OperationDescriptor, PaymentOption, PaymentProtocol, Protocol, ServiceProtocols,
+    OperationDescriptor, PaymentOption, PaymentProtocol, Protocol, ServiceProtocols, TrustProtocol,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,6 +33,8 @@ pub struct ServiceFilters {
     pub operations: Vec<OperationFilter>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub payments: Vec<PaymentFilter>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trust: Vec<TrustProtocol>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -108,6 +110,8 @@ pub struct Facets {
     pub payment_options: Vec<Facet<PaymentOptionFacetValue>>,
     #[serde(default)]
     pub payments: Vec<Facet<PaymentProtocol>>,
+    #[serde(default)]
+    pub trust: Vec<Facet<TrustProtocol>>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
