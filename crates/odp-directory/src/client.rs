@@ -172,6 +172,16 @@ impl DirectoryClient {
                 "Directory search page exceeds 100 Services".to_owned(),
             ));
         }
+        if page.facets.as_ref().is_some_and(|facets| {
+            facets
+                .trust
+                .iter()
+                .any(|facet| facet.value.name != odp_core::Protocol::Tap)
+        }) {
+            return Err(DirectoryError::InvalidResponse(
+                "Directory trust facets are invalid".to_owned(),
+            ));
+        }
         for service in &page.items {
             let canonical = derive_service_origin(&service.service_origin)
                 .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
@@ -327,6 +337,13 @@ fn validate_search_request(request: &SearchRequest) -> Result<(), DirectoryError
                 "keywords must contain at most 32 values of at most 64 characters".to_owned(),
             ));
         }
+        if !filters.trust.is_empty()
+            && (filters.trust.len() != 1 || filters.trust[0].name != odp_core::Protocol::Tap)
+        {
+            return Err(DirectoryError::InvalidRequest(
+                "trust must contain exactly one tap descriptor".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -365,6 +382,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+    use crate::{Facet, ServiceFilters};
 
     struct MockTransport {
         requests: Mutex<Vec<HttpRequest>>,
@@ -406,6 +424,12 @@ mod tests {
         let client = DirectoryClient::with_transport(Environment::Sandbox, transport.clone());
         let page = client
             .search(&SearchRequest {
+                filters: Some(ServiceFilters {
+                    trust: vec![odp_core::TrustProtocol {
+                        name: odp_core::Protocol::Tap,
+                    }],
+                    ..ServiceFilters::default()
+                }),
                 query: "plants".to_owned(),
                 ..SearchRequest::default()
             })
@@ -424,6 +448,38 @@ mod tests {
             "https://sandbox.inflowpay.ai/v1/services/search"
         );
         assert_eq!(requests[0].method, "POST");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
+            serde_json::json!({"filters":{"trust":[{"name":"tap"}]},"query":"plants"})
+        );
+    }
+
+    #[tokio::test]
+    async fn decodes_typed_trust_facets() {
+        let body = br#"{"items":[],"facets":{"trust":[{"value":{"name":"tap"},"count":2}]}}"#;
+        let client = DirectoryClient::with_transport(
+            Environment::Production,
+            Arc::new(ResponseTransport(body.to_vec())),
+        );
+
+        let page = client.search(&SearchRequest::default()).await.unwrap();
+
+        assert_eq!(
+            page.facets.unwrap().trust,
+            [Facet {
+                count: 2,
+                value: odp_core::TrustProtocol {
+                    name: odp_core::Protocol::Tap,
+                },
+            }]
+        );
+
+        let invalid = br#"{"items":[],"facets":{"trust":[{"value":{"name":"mpp"},"count":2}]}}"#;
+        let client = DirectoryClient::with_transport(
+            Environment::Production,
+            Arc::new(ResponseTransport(invalid.to_vec())),
+        );
+        assert!(client.search(&SearchRequest::default()).await.is_err());
     }
 
     #[tokio::test]
@@ -445,6 +501,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("max_items"));
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_trust_filters() {
+        let client = DirectoryClient::with_transport(
+            Environment::Production,
+            Arc::new(MockTransport {
+                requests: Mutex::new(Vec::new()),
+            }),
+        );
+        let error = client
+            .search(&SearchRequest {
+                filters: Some(ServiceFilters {
+                    trust: vec![odp_core::TrustProtocol {
+                        name: odp_core::Protocol::Mpp,
+                    }],
+                    ..ServiceFilters::default()
+                }),
+                ..SearchRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("trust"));
     }
 
     #[tokio::test]
