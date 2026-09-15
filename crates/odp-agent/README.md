@@ -50,9 +50,10 @@ Offering fallback lifetimes.
 Offering attributes, and normalizes usable Action targets. `resolve_action` resolves an Action's
 request schema or unique OpenAPI 3.1 operation without invoking the target. Supporting documents
 are fetched anonymously over HTTPS with independent byte limits and cache entries. Attribute Schema
-resolution accepts JSON Schema Draft 2020-12, loads at most 16 documents through eight reference
-levels, and limits the complete graph to one mebibyte. Cross-document schema composition uses
-`$ref`; `$dynamicRef` accepts only a fragment reference such as `#node`.
+resolution accepts JSON Schema Draft 2020-12 and is limited to 256 KiB per document, 16 documents,
+eight reference levels, and one MiB for the complete graph. OpenAPI documents are limited to one
+MiB. These are fixed SDK safety ceilings. Cross-document schema composition uses `$ref`;
+`$dynamicRef` accepts only a fragment reference such as `#node`.
 
 ## Search across Services
 
