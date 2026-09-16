@@ -33,6 +33,8 @@ pub struct ServiceFilters {
     pub operations: Vec<OperationFilter>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub payments: Vec<PaymentFilter>,
+    /// A trust filter is either empty or the single-item array `[{"name":"tap"}]`: `tap` is the
+    /// only trust protocol this ODP version names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trust: Vec<TrustProtocol>,
 }
@@ -110,6 +112,8 @@ pub struct Facets {
     pub payment_options: Vec<Facet<PaymentOptionFacetValue>>,
     #[serde(default)]
     pub payments: Vec<Facet<PaymentProtocol>>,
+    /// A trust facet counts Services by trust protocol. `tap` is the only one this ODP version
+    /// names, so every descriptor carries that name and nothing else.
     #[serde(default)]
     pub trust: Vec<Facet<TrustProtocol>>,
 }
@@ -120,15 +124,34 @@ pub struct PaymentOptionFacetValue {
     pub option: PaymentOption,
 }
 
+/// A record the Directory published that this client would not hand back.
+///
+/// ROLE-03: a Directory result is discovery metadata, so one unusable record is a note about that
+/// record rather than a reason to withhold the page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceIssue {
+    /// The record's position in the page the Directory sent.
+    pub index: usize,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct SearchPage {
     #[serde(default)]
     pub facets: Option<Facets>,
+    /// The records this client was able to read. Withheld records appear in `issues`.
     pub items: Vec<DirectoryService>,
-    #[serde(default)]
+    #[serde(default, skip)]
+    pub issues: Vec<ServiceIssue>,
+    #[serde(default, deserialize_with = "absent_as_empty")]
     pub next: String,
     #[serde(flatten)]
     pub additional: BTreeMap<String, Value>,
+}
+
+/// A Directory that offers no continuation may omit `next` or send it as null; both mean the same.
+fn absent_as_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

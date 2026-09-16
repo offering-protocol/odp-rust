@@ -1,17 +1,43 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+    sync::Arc,
+};
 
-use odp_core::{derive_service_origin, parse_agent_service_document};
+use odp_core::{Protocol, derive_service_origin, is_public, parse_agent_service_document};
 use serde_json::{Value, json};
 use thiserror::Error;
-use url::Url;
+use url::{Host, Url};
 
 use crate::{
     DirectoryService, Environment, HttpRequest, HttpResponse, IterationOptions, SearchPage,
-    SearchRequest, SuggestionRequest, Transport, TransportError, default_transport,
+    SearchRequest, ServiceIssue, SuggestionRequest, Transport, TransportError, default_transport,
 };
 
 const MAXIMUM_REDIRECTS: usize = 5;
 const MAXIMUM_RESPONSE_BYTES: usize = 524_288;
+/// ERR-21: a failure is described far more tightly than a result is returned.
+const MAXIMUM_ERROR_BYTES: usize = 16_384;
+/// How much of a failure body is worth repeating to a caller.
+const MAXIMUM_ERROR_MESSAGE: usize = 2_048;
+const MAXIMUM_ITEMS_PER_PAGE: usize = 100;
+const MAXIMUM_FACET_ENTRIES: usize = 100;
+const MAXIMUM_SUGGESTIONS: usize = 25;
+const MAXIMUM_TRAVERSAL: usize = 10_000;
+const MAXIMUM_REFERENCE_CHARACTERS: usize = 2_048;
+/// Members a Directory may echo but cannot vouch for.
+///
+/// ROLE-03 and SVC-27: a Directory index is not the Service speaking, and an Agent must read the
+/// Service Document from the Service itself before acting on anything in it. Carrying these
+/// through would invite a caller to act on an endpoint or a capability nobody verified.
+const UNVERIFIED_MEMBERS: &[&str] = &[
+    "branding",
+    "http",
+    "mcp",
+    "odp_version",
+    "payment_origins",
+    "search_capabilities",
+];
 
 #[derive(Debug, Error)]
 pub enum DirectoryError {
@@ -71,23 +97,18 @@ impl DirectoryClient {
         self.request_page("GET", target.as_str(), Vec::new()).await
     }
 
+    /// Every page of a search, up to `max_pages`.
+    ///
+    /// The last page returned still carries its `next`, so a caller that wants to go further can
+    /// resume from it: reaching the bound is not the same as reaching the end.
     pub async fn search_pages(
         &self,
         request: &SearchRequest,
         options: IterationOptions,
     ) -> Result<Vec<SearchPage>, DirectoryError> {
-        let maximum_pages = bounded(options.max_pages, 16, 16, "max_pages")?;
-        let mut pages = Vec::new();
-        let mut page = self.search(request).await?;
-        for _ in 0..maximum_pages {
-            let next = page.next.clone();
-            pages.push(page);
-            if next.is_empty() {
-                return Ok(pages);
-            }
-            page = self.continue_search(&next).await?;
-        }
-        Ok(pages)
+        self.traverse(request, options, usize::MAX)
+            .await
+            .map(|(pages, _)| pages)
     }
 
     pub async fn search_services(
@@ -95,13 +116,49 @@ impl DirectoryClient {
         request: &SearchRequest,
         options: IterationOptions,
     ) -> Result<Vec<DirectoryService>, DirectoryError> {
-        let maximum_items = bounded(options.max_items, 10_000, 10_000, "max_items")?;
-        let pages = self.search_pages(request, options).await?;
+        let maximum_items = bounded(options.max_items, MAXIMUM_TRAVERSAL, "max_items")?;
+        let (pages, _) = self.traverse(request, options, maximum_items).await?;
         Ok(pages
             .into_iter()
             .flat_map(|page| page.items)
             .take(maximum_items)
             .collect())
+    }
+
+    /// Walks a search from its first page, stopping at whichever bound is reached first.
+    ///
+    /// A page is only fetched when something still wants it, so a caller asking for ten Services
+    /// does not pay for a hundred, and a cursor that repeats is refused rather than followed.
+    async fn traverse(
+        &self,
+        request: &SearchRequest,
+        options: IterationOptions,
+        maximum_items: usize,
+    ) -> Result<(Vec<SearchPage>, usize), DirectoryError> {
+        let maximum_pages = bounded(options.max_pages, MAXIMUM_TRAVERSAL, "max_pages")?;
+        // Validated here as well, so `search_pages` refuses the same requests `search_services` does.
+        bounded(options.max_items, MAXIMUM_TRAVERSAL, "max_items")?;
+        let mut pages = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut items = 0_usize;
+        let mut page = self.search(request).await?;
+        loop {
+            items += page.items.len();
+            let next = page.next.clone();
+            pages.push(page);
+            if next.is_empty() || pages.len() >= maximum_pages || items >= maximum_items {
+                return Ok((pages, items));
+            }
+            let target = self.continuation_url(&next)?;
+            if !visited.insert(target.to_string()) {
+                return Err(DirectoryError::InvalidResponse(
+                    "Directory pagination loop detected".to_owned(),
+                ));
+            }
+            page = self
+                .request_page("GET", target.as_str(), Vec::new())
+                .await?;
+        }
     }
 
     pub async fn suggest(
@@ -131,18 +188,7 @@ impl DirectoryClient {
                 .append_pair("limit", &request.limit.to_string());
         }
         let response = self.request("GET", target, Vec::new()).await?;
-        let suggestions = serde_json::from_slice::<Vec<String>>(&response.body)
-            .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
-        if suggestions.len() > 25
-            || suggestions.iter().any(|value| {
-                value.trim() != value || value.is_empty() || value.chars().count() > 128
-            })
-        {
-            return Err(DirectoryError::InvalidResponse(
-                "Directory suggestions are invalid".to_owned(),
-            ));
-        }
-        Ok(suggestions)
+        parse_suggestions(&response.body)
     }
 
     async fn request_page(
@@ -156,41 +202,42 @@ impl DirectoryClient {
         let response = self.request(method, target, body).await?;
         let mut value = serde_json::from_slice::<Value>(&response.body)
             .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
-        if let Some(items) = value
-            .as_object_mut()
-            .and_then(|object| object.get_mut("items"))
+        let object = value.as_object_mut().ok_or_else(|| {
+            DirectoryError::InvalidResponse("Directory search page must be an object".to_owned())
+        })?;
+        require_continuation(object.get("next"))?;
+        require_facets(object.get("facets"))?;
+        let raw = object
+            .get_mut("items")
             .and_then(Value::as_array_mut)
-        {
-            for item in items {
-                normalize_service_protocols(item)?;
-            }
-        }
-        let page = serde_json::from_value::<SearchPage>(value)
-            .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
-        if page.items.len() > 100 {
+            .ok_or_else(|| {
+                DirectoryError::InvalidResponse(
+                    "Directory search page items are invalid".to_owned(),
+                )
+            })?;
+        if raw.len() > MAXIMUM_ITEMS_PER_PAGE {
             return Err(DirectoryError::InvalidResponse(
                 "Directory search page exceeds 100 Services".to_owned(),
             ));
         }
-        if page.facets.as_ref().is_some_and(|facets| {
-            facets
-                .trust
-                .iter()
-                .any(|facet| facet.value.name != odp_core::Protocol::Tap)
-        }) {
-            return Err(DirectoryError::InvalidResponse(
-                "Directory trust facets are invalid".to_owned(),
-            ));
-        }
-        for service in &page.items {
-            let canonical = derive_service_origin(&service.service_origin)
-                .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
-            if canonical != service.service_origin {
-                return Err(DirectoryError::InvalidResponse(
-                    "Directory Service origin is not canonical".to_owned(),
-                ));
+        // ROLE-03: one record this client cannot read is a note about that record. Withholding the
+        // whole page would let a single bad row in an index nobody controls deny every other Service.
+        let mut items = Vec::with_capacity(raw.len());
+        let mut issues = Vec::new();
+        for (index, item) in raw.iter_mut().enumerate() {
+            match read_service(item) {
+                Ok(service) => items.push(service),
+                Err(error) => issues.push(ServiceIssue {
+                    index,
+                    message: error.to_string(),
+                }),
             }
         }
+        object.insert("items".to_owned(), Value::Array(Vec::new()));
+        let mut page = serde_json::from_value::<SearchPage>(value)
+            .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
+        page.items = items;
+        page.issues = issues;
         Ok(page)
     }
 
@@ -200,7 +247,8 @@ impl DirectoryClient {
         mut target: Url,
         mut body: Vec<u8>,
     ) -> Result<HttpResponse, DirectoryError> {
-        for redirects in 0..=MAXIMUM_REDIRECTS {
+        let mut redirects = 0_usize;
+        loop {
             let mut headers =
                 BTreeMap::from([("accept".to_owned(), "application/json".to_owned())]);
             if !body.is_empty() {
@@ -240,10 +288,8 @@ impl DirectoryClient {
                 body.clear();
             }
             target = next;
+            redirects += 1;
         }
-        Err(DirectoryError::InvalidResponse(
-            "Directory response exceeded its redirect limit".to_owned(),
-        ))
     }
 
     fn continuation_url(&self, next: &str) -> Result<Url, DirectoryError> {
@@ -264,10 +310,212 @@ impl DirectoryClient {
     }
 }
 
-fn normalize_service_protocols(item: &mut Value) -> Result<(), DirectoryError> {
-    let Some(object) = item.as_object_mut() else {
+/// Reads one Directory record, or says why it cannot be used.
+fn read_service(item: &mut Value) -> Result<DirectoryService, DirectoryError> {
+    let object = item.as_object_mut().ok_or_else(|| {
+        DirectoryError::InvalidResponse("Directory Service must be an object".to_owned())
+    })?;
+    // ROLE-03 and SVC-27: whatever the index echoed of the Service Document, it did not verify it,
+    // so it does not travel with the record a caller reads.
+    for member in UNVERIFIED_MEMBERS {
+        object.remove(*member);
+    }
+    require_service_origin(object.get("service_origin"))?;
+    require_indexed_at(object.get("indexed_at"))?;
+    normalize_service_protocols(object)?;
+    serde_json::from_value::<DirectoryService>(item.take())
+        .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))
+}
+
+/// SVC-17 and SEC-08: an origin an index published is checked before a caller is handed it.
+fn require_service_origin(value: Option<&Value>) -> Result<(), DirectoryError> {
+    let origin = value.and_then(Value::as_str).ok_or_else(|| {
+        DirectoryError::InvalidResponse("Directory Service origin is missing".to_owned())
+    })?;
+    let canonical = derive_service_origin(origin)
+        .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
+    if canonical != origin {
+        return Err(DirectoryError::InvalidResponse(
+            "Directory Service origin is not canonical".to_owned(),
+        ));
+    }
+    let url =
+        Url::parse(origin).map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
+    // An address literal is judged outright. A name is not resolved here: nothing is being
+    // reached, and an Agent that later connects resolves and judges it again for itself.
+    let reachable = match url.host() {
+        Some(Host::Ipv4(value)) => is_public(IpAddr::V4(value)),
+        Some(Host::Ipv6(value)) => is_public(IpAddr::V6(value)),
+        Some(Host::Domain(value)) => !is_local_name(value),
+        None => false,
+    };
+    if !reachable {
+        return Err(DirectoryError::InvalidResponse(
+            "Directory Service origin names a non-public address".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_local_name(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost")
+}
+
+/// An indexing time is an RFC 3339 timestamp, not whatever a date parser happens to accept.
+fn require_indexed_at(value: Option<&Value>) -> Result<(), DirectoryError> {
+    let indexed_at = value.and_then(Value::as_str).ok_or_else(|| {
+        DirectoryError::InvalidResponse("Directory indexing time is missing".to_owned())
+    })?;
+    if !is_rfc3339(indexed_at) {
+        return Err(DirectoryError::InvalidResponse(
+            "Directory indexing time is not an RFC 3339 timestamp".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_rfc3339(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || value.chars().count() > 64 {
+        return false;
+    }
+    let digits = |range: std::ops::Range<usize>| bytes[range].iter().all(u8::is_ascii_digit);
+    if !digits(0..4) || bytes[4] != b'-' || !digits(5..7) || bytes[7] != b'-' || !digits(8..10) {
+        return false;
+    }
+    if !matches!(bytes[10], b'T' | b't') {
+        return false;
+    }
+    if !digits(11..13) || bytes[13] != b':' || !digits(14..16) || bytes[16] != b':' {
+        return false;
+    }
+    if !digits(17..19) {
+        return false;
+    }
+    let mut rest = &value[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let taken = fraction.chars().take_while(char::is_ascii_digit).count();
+        if taken == 0 {
+            return false;
+        }
+        rest = &fraction[taken..];
+    }
+    if matches!(rest, "Z" | "z") {
+        return true;
+    }
+    let offset = rest.as_bytes();
+    offset.len() == 6
+        && matches!(offset[0], b'+' | b'-')
+        && offset[1..3].iter().all(u8::is_ascii_digit)
+        && offset[3] == b':'
+        && offset[4..6].iter().all(u8::is_ascii_digit)
+}
+
+/// A continuation the Directory offers is a reference this client could actually use.
+fn require_continuation(value: Option<&Value>) -> Result<(), DirectoryError> {
+    let Some(value) = value else {
         return Ok(());
     };
+    if value.is_null() {
+        return Ok(());
+    }
+    let next = value.as_str().ok_or_else(|| {
+        DirectoryError::InvalidResponse("Directory continuation is invalid".to_owned())
+    })?;
+    if next.trim() != next || next.chars().count() > MAXIMUM_REFERENCE_CHARACTERS {
+        return Err(DirectoryError::InvalidResponse(
+            "Directory continuation is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// A facet describes how many Services share a value, so the counts have to be countable.
+fn require_facets(value: Option<&Value>) -> Result<(), DirectoryError> {
+    let Some(Value::Object(groups)) = value else {
+        return Ok(());
+    };
+    // A trust facet counts Services by trust protocol. `tap` is the only one this ODP version
+    // names, and a descriptor carries nothing but that name, so anything else describes a
+    // vocabulary this client cannot read and the page as a whole is not usable.
+    if let Some(entries) = groups.get("trust").and_then(Value::as_array) {
+        let readable = entries.iter().all(|entry| {
+            entry
+                .get("value")
+                .and_then(Value::as_object)
+                .is_some_and(|descriptor| {
+                    descriptor.len() == 1
+                        && descriptor.get("name").and_then(Value::as_str) == Some("tap")
+                })
+        });
+        if !readable {
+            return Err(DirectoryError::InvalidResponse(
+                "Directory trust facets are invalid".to_owned(),
+            ));
+        }
+    }
+    for entries in groups.values() {
+        let Some(entries) = entries.as_array() else {
+            return Err(DirectoryError::InvalidResponse(
+                "Directory facets are invalid".to_owned(),
+            ));
+        };
+        if entries.len() > MAXIMUM_FACET_ENTRIES {
+            return Err(DirectoryError::InvalidResponse(
+                "Directory facet exceeds 100 entries".to_owned(),
+            ));
+        }
+        for entry in entries {
+            let countable = entry
+                .get("count")
+                .is_some_and(|count| count.as_u64().is_some());
+            if !countable {
+                return Err(DirectoryError::InvalidResponse(
+                    "Directory facet count is invalid".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The Directory answers suggestions as an envelope, and repeats nothing this client would not.
+fn parse_suggestions(body: &[u8]) -> Result<Vec<String>, DirectoryError> {
+    let value = serde_json::from_slice::<Value>(body)
+        .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
+    let items = value
+        .as_object()
+        .and_then(|object| object.get("items"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            DirectoryError::InvalidResponse("Directory suggestions are invalid".to_owned())
+        })?;
+    let mut seen = BTreeSet::new();
+    let mut suggestions = Vec::new();
+    for item in items {
+        let suggestion = item.as_str().filter(|value| {
+            !value.trim().is_empty() && value.trim() == *value && value.chars().count() <= 128
+        });
+        let Some(suggestion) = suggestion else {
+            return Err(DirectoryError::InvalidResponse(
+                "Directory suggestions are invalid".to_owned(),
+            ));
+        };
+        if seen.insert(suggestion.to_owned()) {
+            suggestions.push(suggestion.to_owned());
+        }
+        if suggestions.len() == MAXIMUM_SUGGESTIONS {
+            break;
+        }
+    }
+    Ok(suggestions)
+}
+
+/// `read_service` has already established that `object` is a Service-shaped object.
+fn normalize_service_protocols(
+    object: &mut serde_json::Map<String, Value>,
+) -> Result<(), DirectoryError> {
     let Some(protocols) = object.get("protocols").cloned() else {
         return Ok(());
     };
@@ -300,13 +548,8 @@ fn normalize_service_protocols(item: &mut Value) -> Result<(), DirectoryError> {
     Ok(())
 }
 
-fn bounded(
-    value: usize,
-    fallback: usize,
-    maximum: usize,
-    name: &str,
-) -> Result<usize, DirectoryError> {
-    let value = if value == 0 { fallback } else { value };
+fn bounded(value: usize, maximum: usize, name: &str) -> Result<usize, DirectoryError> {
+    let value = if value == 0 { maximum } else { value };
     if value > maximum {
         return Err(DirectoryError::InvalidRequest(format!(
             "{name} must be from 1 through {maximum}"
@@ -316,7 +559,7 @@ fn bounded(
 }
 
 fn validate_search_request(request: &SearchRequest) -> Result<(), DirectoryError> {
-    if request.limit > 100 {
+    if request.limit > MAXIMUM_ITEMS_PER_PAGE {
         return Err(DirectoryError::InvalidRequest(
             "limit must be from 1 through 100".to_owned(),
         ));
@@ -326,53 +569,154 @@ fn validate_search_request(request: &SearchRequest) -> Result<(), DirectoryError
             "query must contain at most 512 characters without surrounding whitespace".to_owned(),
         ));
     }
-    if let Some(filters) = &request.filters {
-        if filters.keywords.len() > 32
-            || filters
-                .keywords
-                .iter()
-                .any(|value| value.is_empty() || value.chars().count() > 64)
-        {
-            return Err(DirectoryError::InvalidRequest(
-                "keywords must contain at most 32 values of at most 64 characters".to_owned(),
-            ));
-        }
-        if !filters.trust.is_empty()
-            && (filters.trust.len() != 1 || filters.trust[0].name != odp_core::Protocol::Tap)
-        {
-            return Err(DirectoryError::InvalidRequest(
-                "trust must contain exactly one tap descriptor".to_owned(),
-            ));
+    let Some(filters) = &request.filters else {
+        return Ok(());
+    };
+    if filters.keywords.len() > 32
+        || filters
+            .keywords
+            .iter()
+            .any(|value| value.trim().is_empty() || value.chars().count() > 64)
+    {
+        return Err(DirectoryError::InvalidRequest(
+            "keywords must contain at most 32 values of at most 64 characters".to_owned(),
+        ));
+    }
+    require_unique(&filters.keywords, "keywords")?;
+    // A Directory rejects the whole request over a repeated filter, so a caller hears about it
+    // here rather than as an opaque 400.
+    if filters.enrollment.len() > 1 {
+        return Err(DirectoryError::InvalidRequest(
+            "enrollment must contain at most 1 value".to_owned(),
+        ));
+    }
+    if filters.operations.len() > 21 {
+        return Err(DirectoryError::InvalidRequest(
+            "operations must contain at most 21 values".to_owned(),
+        ));
+    }
+    require_unique(&filters.operations, "operations")?;
+    if filters.payments.len() > 32 {
+        return Err(DirectoryError::InvalidRequest(
+            "payments must contain at most 32 values".to_owned(),
+        ));
+    }
+    require_unique(&filters.payments, "payments")?;
+    for payment in &filters.payments {
+        require_unique(&payment.options, "payment options")?;
+    }
+    // A trust filter, when present, is the single-item array `[{"name":"tap"}]`: `tap` is the only
+    // trust protocol this ODP version names, and the Directory refuses anything else.
+    if !filters.trust.is_empty()
+        && (filters.trust.len() != 1 || filters.trust[0].name != Protocol::Tap)
+    {
+        return Err(DirectoryError::InvalidRequest(
+            "trust must be the single-item array [{\"name\":\"tap\"}]".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_unique<T: PartialEq>(values: &[T], name: &str) -> Result<(), DirectoryError> {
+    for (index, value) in values.iter().enumerate() {
+        if values[..index].contains(value) {
+            return Err(DirectoryError::InvalidRequest(format!(
+                "{name} must not repeat a value"
+            )));
         }
     }
     Ok(())
 }
 
 fn consume_response(response: HttpResponse) -> Result<HttpResponse, DirectoryError> {
-    if response.body.len() > MAXIMUM_RESPONSE_BYTES {
+    let declared = response
+        .headers
+        .get("content-length")
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    let failed = !(200..300).contains(&response.status);
+    // ERR-21: a failure is read under a far tighter limit than a result.
+    let limit = if failed {
+        MAXIMUM_ERROR_BYTES
+    } else {
+        MAXIMUM_RESPONSE_BYTES
+    };
+    if failed {
+        return Err(DirectoryError::Request {
+            message: failure_message(&response, limit, declared),
+            headers: response.headers,
+            status: response.status,
+        });
+    }
+    if declared.is_some_and(|value| value > limit) || response.body.len() > limit {
         return Err(DirectoryError::InvalidResponse(
             "Directory response exceeds 524288 bytes".to_owned(),
         ));
     }
-    if !(200..300).contains(&response.status) {
-        let message = String::from_utf8_lossy(&response.body).into_owned();
-        return Err(DirectoryError::Request {
-            headers: response.headers,
-            message,
-            status: response.status,
-        });
-    }
-    let content_type = response
-        .headers
-        .get("content-type")
-        .map(|value| value.split(';').next().unwrap_or_default().trim())
-        .unwrap_or_default();
-    if !content_type.eq_ignore_ascii_case("application/json") {
+    if !media_type(&response.headers).eq_ignore_ascii_case("application/json") {
         return Err(DirectoryError::InvalidResponse(
             "Directory response must use application/json".to_owned(),
         ));
     }
     Ok(response)
+}
+
+/// What a failure is worth repeating to a caller.
+///
+/// The status already says what happened; this is the Directory's own account of why. The body
+/// belongs to whoever answered, so it is read only when it claims to be one of the two shapes
+/// that carry a reason, only up to the limit, and only as printable text of bounded length.
+/// Anything else leaves the account empty rather than repeating an unread body.
+fn failure_message(response: &HttpResponse, limit: usize, declared: Option<usize>) -> String {
+    let media_type = media_type(&response.headers);
+    let describable = media_type.eq_ignore_ascii_case("application/json")
+        || media_type.eq_ignore_ascii_case("application/problem+json");
+    if !describable || declared.is_some_and(|value| value > limit) || response.body.len() > limit {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&response.body);
+    let detail = serde_json::from_str::<Value>(&text)
+        .ok()
+        .filter(Value::is_object)
+        .and_then(|value| {
+            ["detail", "title", "message"]
+                .iter()
+                .filter_map(|member| value.get(*member).and_then(Value::as_str))
+                .find(|found| !found.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| text.into_owned());
+    printable(&detail)
+}
+
+/// Flattens control characters and keeps the excerpt short enough to read.
+fn printable(value: &str) -> String {
+    let flattened = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let collapsed = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAXIMUM_ERROR_MESSAGE {
+        return collapsed;
+    }
+    let mut truncated = collapsed
+        .chars()
+        .take(MAXIMUM_ERROR_MESSAGE)
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn media_type(headers: &BTreeMap<String, String>) -> &str {
+    headers
+        .get("content-type")
+        .map(|value| value.split(';').next().unwrap_or_default().trim())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -382,7 +726,6 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::{Facet, ServiceFilters};
 
     struct MockTransport {
         requests: Mutex<Vec<HttpRequest>>,
@@ -424,12 +767,6 @@ mod tests {
         let client = DirectoryClient::with_transport(Environment::Sandbox, transport.clone());
         let page = client
             .search(&SearchRequest {
-                filters: Some(ServiceFilters {
-                    trust: vec![odp_core::TrustProtocol {
-                        name: odp_core::Protocol::Tap,
-                    }],
-                    ..ServiceFilters::default()
-                }),
                 query: "plants".to_owned(),
                 ..SearchRequest::default()
             })
@@ -448,38 +785,6 @@ mod tests {
             "https://sandbox.inflowpay.ai/v1/services/search"
         );
         assert_eq!(requests[0].method, "POST");
-        assert_eq!(
-            serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
-            serde_json::json!({"filters":{"trust":[{"name":"tap"}]},"query":"plants"})
-        );
-    }
-
-    #[tokio::test]
-    async fn decodes_typed_trust_facets() {
-        let body = br#"{"items":[],"facets":{"trust":[{"value":{"name":"tap"},"count":2}]}}"#;
-        let client = DirectoryClient::with_transport(
-            Environment::Production,
-            Arc::new(ResponseTransport(body.to_vec())),
-        );
-
-        let page = client.search(&SearchRequest::default()).await.unwrap();
-
-        assert_eq!(
-            page.facets.unwrap().trust,
-            [Facet {
-                count: 2,
-                value: odp_core::TrustProtocol {
-                    name: odp_core::Protocol::Tap,
-                },
-            }]
-        );
-
-        let invalid = br#"{"items":[],"facets":{"trust":[{"value":{"name":"mpp"},"count":2}]}}"#;
-        let client = DirectoryClient::with_transport(
-            Environment::Production,
-            Arc::new(ResponseTransport(invalid.to_vec())),
-        );
-        assert!(client.search(&SearchRequest::default()).await.is_err());
     }
 
     #[tokio::test]
@@ -504,29 +809,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unsupported_trust_filters() {
-        let client = DirectoryClient::with_transport(
-            Environment::Production,
-            Arc::new(MockTransport {
-                requests: Mutex::new(Vec::new()),
-            }),
-        );
-        let error = client
-            .search(&SearchRequest {
-                filters: Some(ServiceFilters {
-                    trust: vec![odp_core::TrustProtocol {
-                        name: odp_core::Protocol::Mpp,
-                    }],
-                    ..ServiceFilters::default()
-                }),
-                ..SearchRequest::default()
-            })
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("trust"));
-    }
-
-    #[tokio::test]
     async fn filters_unknown_protocols_and_rejects_malformed_known_protocols() {
         let body = br#"{"items":[{"description":"Plants","indexed_at":"2026-08-25T00:00:00Z","language":"en","localizations":["en"],"name":"Plants","operations":[],"protocols":{"payments":[{"authentication":"not-required","name":"future-payment"},{"authentication":"not-required","name":"mpp"}],"trust":[{"name":"future-trust"},{"name":"tap"}]},"service_origin":"https://demo.inflowpay.ai"}]}"#;
         let client = DirectoryClient::with_transport(
@@ -544,6 +826,11 @@ mod tests {
             Environment::Production,
             Arc::new(ResponseTransport(malformed.into_bytes())),
         );
-        assert!(client.search(&SearchRequest::default()).await.is_err());
+        // A malformed known protocol makes that one record unusable, and says so, rather than
+        // withholding every other Service on the page.
+        let page = client.search(&SearchRequest::default()).await.unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.issues.len(), 1);
+        assert_eq!(page.issues[0].index, 0);
     }
 }

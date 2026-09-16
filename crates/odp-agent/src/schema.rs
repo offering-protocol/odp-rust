@@ -44,6 +44,7 @@ pub(crate) async fn resolve_schema(
                 "application/schema+json",
                 &["application/schema+json"],
                 MAXIMUM_DOCUMENT_BYTES,
+                client.cache_fallbacks().schema,
             )
             .await?;
         require_schema(&document)?;

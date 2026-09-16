@@ -1091,6 +1091,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tiny_http",
  "tokio",
  "url",
 ]
