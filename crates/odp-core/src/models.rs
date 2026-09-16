@@ -500,7 +500,13 @@ pub struct CollectionSearchRequest {
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub limit: usize,
     pub odp_version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// COL-06: an omitted `parent_id` applies no hierarchy constraint, while a JSON `null` asks
+    /// for root Collections. `None` is the first, `Some(None)` the second.
+    #[serde(
+        default,
+        deserialize_with = "explicit_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub parent_id: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub query: String,
@@ -531,6 +537,20 @@ pub struct OfferingSearchRequest {
 
 fn is_zero_usize(value: &usize) -> bool {
     *value == 0
+}
+
+/// Reads a member that was present as `Some`, even when what it carried was `null`.
+///
+/// `Option<Option<T>>` on its own cannot tell the two apart: serde reads a JSON `null` straight
+/// into the outer `None`, the same answer an absent member gives. Only the inner `Option` is read
+/// here, so `#[serde(default)]` supplies `None` when the member is absent and this supplies
+/// `Some(None)` when it is present and null.
+fn explicit_null<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
