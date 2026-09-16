@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::OnceLock};
+use std::{borrow::Cow, collections::BTreeMap, sync::OnceLock};
 
 use include_dir::{Dir, include_dir};
 use jsonschema::{Registry, Validator};
@@ -9,8 +9,8 @@ use thiserror::Error;
 
 use crate::{
     Collection, CollectionSearchRequest, FilterDefinition, FilterOperator, FilterType, Offering,
-    OfferingPage, OfferingSearchRequest, Operation, Page, ProblemDetails, ResourceIdentity,
-    ServiceDocument, SortDefinition,
+    OfferingPage, OfferingSearchRequest, Operation, Page, ProblemDetails, RefinementGroup,
+    ResourceIdentity, ServiceDocument, SortDefinition,
 };
 
 static SCHEMA_FILES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/schemas");
@@ -62,13 +62,11 @@ pub fn normalize_agent_response(data: &[u8], kind: &str) -> Result<Vec<u8>, Pars
         document_type: "Agent response".to_owned(),
         issues: vec![issue("", "json", &error.to_string())],
     })?;
+    validate_json_depth(&raw, if kind == "service-document" { 8 } else { 16 })?;
     normalize_agent_document(&mut raw, kind);
-    serde_json::to_vec(&raw)
-        .map_err(|error| ValidationError {
-            document_type: "Agent response".to_owned(),
-            issues: vec![issue("", "json", &error.to_string())],
-        })
-        .map_err(ParseError::from)
+    // Re-encoding cannot fail, so it reports no error to handle: a `Value` holds only what JSON
+    // can spell, and its `Display` writes that spelling directly rather than through a `Result`.
+    Ok(raw.to_string().into_bytes())
 }
 
 fn normalize_agent_document(document: &mut Value, kind: &str) {
@@ -273,7 +271,8 @@ fn normalize_branding(document: &mut Value) {
             .and_then(Value::as_str)
             .is_some_and(|image_type| !recognized.contains(&image_type));
         if unknown {
-            branding.remove(member);
+            object.remove("branding");
+            return;
         } else if let Some(Value::Object(image)) = branding.get_mut(member) {
             image.retain(|key, _value| matches!(key.as_str(), "src" | "type"));
         }
@@ -325,6 +324,7 @@ fn normalize_offering(document: &mut Value) {
         .is_some_and(|schema| schema.keys().any(|key| key != "url"))
     {
         object.remove("schema");
+        object.remove("attributes");
     }
     let known_prices = ["fixed", "free", "metered", "quote", "range", "starting_at"];
     let unknown_price = object
@@ -537,9 +537,45 @@ pub fn parse_collection(data: &[u8]) -> Result<Collection, ParseError> {
         "collection.schema.json",
         "Collection",
         |value: &Collection| {
-            representation_issues(&value.language, &value.localizations, &value.images)
+            let mut issues = collection_representation_issues(value);
+            issues.extend(collection_issues(value));
+            issues
         },
     )
+}
+
+/// Reads a Collection an Agent received.
+///
+/// ROLE-03: discovery metadata an Agent can still use is not withheld over a defect it can work
+/// around, so the invariants `collection_issues` states -- which describe a hierarchy the Agent
+/// simply does not walk -- do not refuse the document here. A Service, which MUST NOT publish one,
+/// goes through [`parse_collection`].
+pub fn parse_agent_collection(data: &[u8]) -> Result<Collection, ParseError> {
+    parse(
+        &normalize_agent_response(data, "collection")?,
+        "collection.schema.json",
+        "Collection",
+        collection_representation_issues,
+    )
+}
+
+fn collection_representation_issues(value: &Collection) -> Vec<ValidationIssue> {
+    representation_issues(&value.language, &value.localizations, &value.images)
+}
+
+/// The Collection rules a JSON Schema cannot state: they compare one member against another.
+fn collection_issues(value: &Collection) -> Vec<ValidationIssue> {
+    // COL-20: a Collection naming itself as a parent is a one-node cycle, so anything walking the
+    // hierarchy upwards from it would never reach a root.
+    if value.parent_ids.contains(&value.id) {
+        vec![issue(
+            "/parent_ids",
+            "self-parent",
+            "must not name the Collection itself",
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn parse_offering(data: &[u8]) -> Result<Offering, ParseError> {
@@ -548,9 +584,84 @@ pub fn parse_offering(data: &[u8]) -> Result<Offering, ParseError> {
         "offering.schema.json",
         "Offering",
         |value: &Offering| {
-            representation_issues(&value.language, &value.localizations, &value.images)
+            let mut issues = offering_representation_issues(value);
+            issues.extend(offering_issues(value));
+            issues
         },
     )
+}
+
+/// Reads an Offering an Agent received.
+///
+/// ROLE-03: a defect an Agent can describe to its caller is a note about that Offering rather than
+/// a reason to discard it, so the invariants `offering_issues` states are left for the Agent to
+/// report against the Actions or price they concern. A Service, which MUST NOT publish one, goes
+/// through [`parse_offering`].
+pub fn parse_agent_offering(data: &[u8]) -> Result<Offering, ParseError> {
+    parse(
+        &normalize_agent_response(data, "offering")?,
+        "offering.schema.json",
+        "Offering",
+        offering_representation_issues,
+    )
+}
+
+fn offering_representation_issues(value: &Offering) -> Vec<ValidationIssue> {
+    representation_issues(&value.language, &value.localizations, &value.images)
+}
+
+/// The Offering rules a JSON Schema cannot state: they compare one member against another.
+fn offering_issues(value: &Offering) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    // OFR-57: an Action identifier is unique within its Offering, so a repeat leaves an Agent
+    // unable to say which Action a caller meant.
+    let mut identifiers = std::collections::BTreeSet::new();
+    if value
+        .actions
+        .iter()
+        .any(|action| !identifiers.insert(&action.id))
+    {
+        issues.push(issue(
+            "/actions",
+            "unique-action-id",
+            "must contain unique Action identifiers",
+        ));
+    }
+    // OFR-49: a range whose minimum is above its maximum describes no price at all.
+    if let Some(price) = &value.price {
+        if price.price_type == crate::PriceType::Range
+            && compare_decimals(&price.minimum, &price.maximum).is_gt()
+        {
+            issues.push(issue(
+                "/price/minimum",
+                "price-range",
+                "must be less than or equal to maximum",
+            ));
+        }
+    }
+    issues
+}
+
+/// Orders two ODP monetary values, which are decimal strings rather than JSON numbers (OFR-48).
+///
+/// The schema already fixes the shape as digits with an optional fractional part, so the two are
+/// compared digit by digit: the longer whole part is larger, and otherwise the first difference
+/// decides. Parsing to a float would lose precision the decimal form exists to keep.
+fn compare_decimals(left: &str, right: &str) -> std::cmp::Ordering {
+    fn split(value: &str) -> (&str, &str) {
+        let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+        (
+            whole.trim_start_matches('0'),
+            fraction.trim_end_matches('0'),
+        )
+    }
+    let (left_whole, left_fraction) = split(left);
+    let (right_whole, right_fraction) = split(right);
+    left_whole
+        .len()
+        .cmp(&right_whole.len())
+        .then_with(|| left_whole.cmp(right_whole))
+        .then_with(|| left_fraction.cmp(right_fraction))
 }
 
 pub fn parse_problem_details(data: &[u8]) -> Result<ProblemDetails, ParseError> {
@@ -603,11 +714,74 @@ pub fn parse_offering_search_request(data: &[u8]) -> Result<OfferingSearchReques
 }
 
 pub fn parse_offering_search_response(data: &[u8]) -> Result<OfferingPage<Offering>, ParseError> {
-    parse_without_refinement(
+    parse(
         data,
         "offering-search-response.schema.json",
         "Offering search response",
+        |value: &OfferingPage<Offering>| refinement_issues(&value.refinements),
     )
+}
+
+/// Reads an Offering-search response an Agent received.
+///
+/// A Refinement Group the Agent cannot use is not a reason to discard the Offering results beside
+/// it, so the invariants `refinement_issues` states do not refuse the page here. A Service, which
+/// MUST NOT publish one, goes through [`parse_offering_search_response`].
+pub fn parse_agent_offering_search_response(
+    data: &[u8],
+) -> Result<OfferingPage<Offering>, ParseError> {
+    parse_without_refinement(
+        &normalize_agent_response(data, "offering-page")?,
+        "offering-search-response.schema.json",
+        "Offering search response",
+    )
+}
+
+/// The Refinement rules a JSON Schema cannot state: they compare one member against another.
+fn refinement_issues(groups: &[RefinementGroup]) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    // FLT-30: `filter_id` is unique among the returned groups, so a repeat leaves an Agent unable
+    // to say which group belongs to that Filter Definition.
+    let mut identifiers = std::collections::BTreeSet::new();
+    if groups
+        .iter()
+        .any(|group| !identifiers.insert(&group.filter_id))
+    {
+        issues.push(issue(
+            "/refinements",
+            "unique-filter-id",
+            "must contain unique Refinement Group identifiers",
+        ));
+    }
+    // FLT-32: bucket values are unique within a group. The schema's `uniqueItems` compares whole
+    // buckets, so it passes two buckets that name one value with differing counts -- exactly the
+    // case that leaves an Agent with two counts for the same candidate and no way to choose.
+    for (index, group) in groups.iter().enumerate() {
+        let mut values = std::collections::BTreeSet::new();
+        if group
+            .values
+            .iter()
+            .any(|bucket| !values.insert(bucket_key(&bucket.value)))
+        {
+            issues.push(issue(
+                &format!("/refinements/{index}/values"),
+                "unique-bucket-value",
+                "must contain unique Refinement Bucket values",
+            ));
+        }
+    }
+    issues
+}
+
+// String values need their Filter Definition before decimal equality can be applied.
+fn bucket_key(value: &Value) -> String {
+    match value {
+        Value::String(text) => format!("s{text}"),
+        Value::Number(number) => number
+            .as_f64()
+            .map_or_else(|| format!("n{number}"), |float| format!("n{float}")),
+        other => format!("o{other}"),
+    }
 }
 
 pub fn parse_filter_definition(data: &[u8]) -> Result<FilterDefinition, ParseError> {
@@ -644,12 +818,35 @@ pub fn validate_value(
     schema_name: &str,
     document_type: &str,
 ) -> Result<(), ParseError> {
+    validate_json_depth(
+        value,
+        if schema_name == "service-document.schema.json" {
+            8
+        } else {
+            16
+        },
+    )?;
+    let mut compatible = Cow::Borrowed(value);
+    if value
+        .get("odp_version")
+        .and_then(Value::as_str)
+        .is_some_and(|version| {
+            version != crate::VERSION
+                && version.strip_prefix("1.").is_some_and(|minor| {
+                    !minor.is_empty()
+                        && (minor == "0" || !minor.starts_with('0'))
+                        && minor.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
+    {
+        compatible.to_mut()["odp_version"] = Value::String(crate::VERSION.to_owned());
+    }
     let schemas = schemas()?;
     let validator = schemas.validators.get(schema_name).ok_or_else(|| {
         ParseError::SchemaInitialization(format!("missing bundled schema {schema_name}"))
     })?;
     let issues = validator
-        .iter_errors(value)
+        .iter_errors(&compatible)
         .map(|error| {
             let schema_path = error.schema_path().to_string();
             ValidationIssue {
@@ -674,6 +871,31 @@ pub fn validate_value(
         }
         .into())
     }
+}
+
+/// Checks JSON nesting from a top-level depth of one before protocol data is exposed.
+pub fn validate_json_depth(value: &Value, maximum: usize) -> Result<(), ParseError> {
+    let mut pending = vec![(value, 1)];
+    while let Some((value, depth)) = pending.pop() {
+        if !value.is_object() && !value.is_array() {
+            continue;
+        }
+        if depth > maximum {
+            return Err(ValidationError {
+                document_type: "JSON document".to_owned(),
+                issues: vec![issue("", "depth", "exceeds the JSON nesting depth limit")],
+            }
+            .into());
+        }
+        match value {
+            Value::Object(values) => {
+                pending.extend(values.values().map(|value| (value, depth + 1)))
+            }
+            Value::Array(values) => pending.extend(values.iter().map(|value| (value, depth + 1))),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn parse_without_refinement<T: DeserializeOwned>(
@@ -918,11 +1140,18 @@ fn filter_definition_issues(value: &FilterDefinition) -> Vec<ValidationIssue> {
             "contains an operator incompatible with the Filter type",
         ));
     }
-    if value.filter_type == FilterType::Boolean && value.unit.is_some() {
+    // FLT-10: only a numeric Filter carries a unit. A unit on a string, date, date-time or
+    // boolean Filter describes a dimension its values do not have, so an Agent reading it would
+    // convert or label values that were never quantities.
+    if !matches!(
+        value.filter_type,
+        FilterType::Decimal | FilterType::Integer | FilterType::Number
+    ) && value.unit.is_some()
+    {
         issues.push(issue(
             "/unit",
             "unit-type",
-            "must not appear on a boolean Filter",
+            "must not appear on a non-numeric Filter",
         ));
     }
     issues

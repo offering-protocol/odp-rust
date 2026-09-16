@@ -7,19 +7,23 @@ use std::{
 use odp_core::{
     Collection, CollectionSearchRequest, Offering, OfferingPage, OfferingSearchRequest, Operation,
     Page, ParseError, Representation, ServiceDocument, build_operation_url, derive_service_origin,
-    normalize_agent_response, parse_agent_service_document, parse_collection, parse_offering,
-    parse_offering_search_response, parse_page, parse_problem_response, resolve_continuation,
+    normalize_agent_response, parse_agent_collection, parse_agent_offering,
+    parse_agent_offering_search_response, parse_agent_service_document, parse_page,
+    parse_problem_response, resolve_continuation,
 };
 use odp_directory::{HttpRequest, ReqwestTransport, Transport, TransportError};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
-use crate::{Cache, CacheFallbacks, CacheRecord, default_cache};
+use crate::{Cache, CacheFallbacks, CacheRecord, SecureTransport, default_cache};
 
 const MEDIA_TYPE: &str = "application/odp+json";
+const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 const MAX_DOCUMENT_BYTES: usize = 65_536;
 const MAX_RESOURCE_BYTES: usize = 524_288;
+/// ERR-21: a Problem Details response is read far more tightly than a successful one.
+const MAX_PROBLEM_BYTES: usize = 16_384;
 const MAX_REDIRECTS: usize = 5;
 const MAX_TRAVERSAL_ITEMS: usize = 10_000;
 const MAX_TRAVERSAL_PAGES: usize = 16;
@@ -87,20 +91,43 @@ pub struct ServiceClient {
 }
 
 impl ServiceClient {
+    /// A client that reaches public destinations only (SEC-08).
     pub fn new(service_url: &str) -> Result<Self, AgentError> {
-        Self::with_transport(service_url, Arc::new(ReqwestTransport::new()?))
+        Self::with_transport(
+            service_url,
+            Arc::new(SecureTransport::new(Arc::new(ReqwestTransport::new()?))),
+        )
     }
 
+    /// A client that also accepts a Service on loopback, for local development.
+    ///
+    /// The relaxation reaches loopback and nothing else: a name resolving anywhere else in a
+    /// private network is still refused.
+    pub fn for_local_development(service_url: &str) -> Result<Self, AgentError> {
+        let transport: Arc<dyn Transport> = Arc::new(SecureTransport::for_local_development(
+            Arc::new(ReqwestTransport::new()?),
+        ));
+        let mut client = Self::with_transport(service_url, transport.clone())?;
+        client.supporting_transport = transport;
+        Ok(client)
+    }
+
+    /// A client over a caller-supplied transport. The caller owns its destination policy: a
+    /// transport that reaches the network should be wrapped in [`SecureTransport`].
     pub fn with_transport(
         service_url: &str,
         transport: Arc<dyn Transport>,
     ) -> Result<Self, AgentError> {
-        let supporting_transport = Arc::new(ReqwestTransport::new()?);
+        let mut partition = [0_u8; 32];
+        getrandom::fill(&mut partition)
+            .map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
+        let supporting_transport: Arc<dyn Transport> =
+            Arc::new(SecureTransport::new(Arc::new(ReqwestTransport::new()?)));
         Ok(Self {
             accept_language: None,
             cache: default_cache(),
             cache_fallbacks: CacheFallbacks::default(),
-            cache_partition: "anonymous".to_owned(),
+            cache_partition: sha256_hex(&partition),
             service_origin: derive_service_origin(service_url)
                 .map_err(|error| AgentError::InvalidRequest(error.to_string()))?,
             supporting_transport,
@@ -163,7 +190,7 @@ impl ServiceClient {
         limit: usize,
     ) -> Result<Page<Collection>, AgentError> {
         let page = self
-            .get_page(Operation::ListCollections, None, representation, limit)
+            .get_collection_page(Operation::ListCollections, representation, limit)
             .await?;
         validate_collections(page)
     }
@@ -239,6 +266,14 @@ impl ServiceClient {
     }
 
     pub async fn continue_collections(&self, next: &str) -> Result<Page<Collection>, AgentError> {
+        self.continue_collections_with(next, Duration::ZERO).await
+    }
+
+    async fn continue_collections_with(
+        &self,
+        next: &str,
+        fallback: Duration,
+    ) -> Result<Page<Collection>, AgentError> {
         let target = resolve_continuation(next, &self.service_origin)
             .map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
         let response = self
@@ -247,7 +282,7 @@ impl ServiceClient {
                 target,
                 Vec::new(),
                 MAX_RESOURCE_BYTES,
-                self.cache_fallbacks.collection,
+                fallback,
                 validate_collection_page_bytes,
             )
             .await?;
@@ -258,6 +293,14 @@ impl ServiceClient {
         &self,
         next: &str,
     ) -> Result<OfferingPage<Offering>, AgentError> {
+        self.continue_offerings_with(next, Duration::ZERO).await
+    }
+
+    async fn continue_offerings_with(
+        &self,
+        next: &str,
+        fallback: Duration,
+    ) -> Result<OfferingPage<Offering>, AgentError> {
         let target = resolve_continuation(next, &self.service_origin)
             .map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
         let response = self
@@ -266,7 +309,7 @@ impl ServiceClient {
                 target,
                 Vec::new(),
                 MAX_RESOURCE_BYTES,
-                self.cache_fallbacks.offering,
+                fallback,
                 validate_offering_page_bytes,
             )
             .await?;
@@ -280,7 +323,8 @@ impl ServiceClient {
         options: TraversalOptions,
     ) -> Result<Vec<Collection>, AgentError> {
         let mut page = self.list_collections(representation, limit).await?;
-        self.collect_collections(&mut page, options).await
+        self.collect_collections(&mut page, options, self.cache_fallbacks.collection)
+            .await
     }
 
     pub async fn list_all_offerings(
@@ -290,7 +334,8 @@ impl ServiceClient {
         options: TraversalOptions,
     ) -> Result<Vec<Offering>, AgentError> {
         let mut page = self.list_offerings(representation, limit).await?;
-        self.collect_offerings(&mut page, options).await
+        self.collect_offerings(&mut page, options, self.cache_fallbacks.offering)
+            .await
     }
 
     pub async fn search_all_offerings(
@@ -300,13 +345,15 @@ impl ServiceClient {
         options: TraversalOptions,
     ) -> Result<Vec<Offering>, AgentError> {
         let mut page = self.search_offerings(request, representation).await?;
-        self.collect_offerings(&mut page, options).await
+        self.collect_offerings(&mut page, options, self.cache_fallbacks.search)
+            .await
     }
 
     async fn collect_collections(
         &self,
         page: &mut Page<Collection>,
         options: TraversalOptions,
+        fallback: Duration,
     ) -> Result<Vec<Collection>, AgentError> {
         let (maximum_items, maximum_pages) = traversal_bounds(options)?;
         let mut result = Vec::new();
@@ -316,7 +363,7 @@ impl ServiceClient {
                 return Ok(result);
             }
             if page_number + 1 < maximum_pages {
-                *page = self.continue_collections(&page.next).await?;
+                *page = self.continue_collections_with(&page.next, fallback).await?;
             }
         }
         Ok(result)
@@ -326,6 +373,7 @@ impl ServiceClient {
         &self,
         page: &mut OfferingPage<Offering>,
         options: TraversalOptions,
+        fallback: Duration,
     ) -> Result<Vec<Offering>, AgentError> {
         let (maximum_items, maximum_pages) = traversal_bounds(options)?;
         let mut result = Vec::new();
@@ -335,31 +383,25 @@ impl ServiceClient {
                 return Ok(result);
             }
             if page_number + 1 < maximum_pages {
-                *page = self.continue_offerings(&page.next).await?;
+                *page = self.continue_offerings_with(&page.next, fallback).await?;
             }
         }
         Ok(result)
     }
 
-    async fn get_page<T: serde::de::DeserializeOwned>(
+    async fn get_collection_page(
         &self,
         operation: Operation,
-        id: Option<&str>,
         representation: Representation,
         limit: usize,
-    ) -> Result<Page<T>, AgentError> {
+    ) -> Result<Page<Collection>, AgentError> {
         let data = self
-            .get_page_bytes(operation, id, representation, limit)
+            .get_page_bytes(operation, None, representation, limit)
             .await?;
-        let kind = if matches!(
-            operation,
-            Operation::ListCollections | Operation::SearchCollections
-        ) {
-            "collection-page"
-        } else {
-            "offering-page"
-        };
-        Ok(parse_page(&normalize_agent_response(&data, kind)?)?)
+        Ok(parse_page(&normalize_agent_response(
+            &data,
+            "collection-page",
+        )?)?)
     }
 
     async fn get_offering_page(
@@ -447,11 +489,7 @@ impl ServiceClient {
         target
             .query_pairs_mut()
             .append_pair("representation", representation_name(representation));
-        let fallback = if operation == Operation::SearchCollections {
-            self.cache_fallbacks.collection
-        } else {
-            self.cache_fallbacks.offering
-        };
+        let fallback = self.cache_fallbacks.search;
         let validator = response_validator(operation);
         Ok(self
             .request_cached(
@@ -489,7 +527,11 @@ impl ServiceClient {
         fallback: Duration,
         validate: fn(&[u8]) -> Result<(), AgentError>,
     ) -> Result<Response, AgentError> {
-        let key = self.cache_key(method, target.as_str(), &body);
+        let key = format!(
+            "{}\n{}",
+            self.cache_key(method, target.as_str(), &body),
+            fallback.as_nanos()
+        );
         let request_origin = derive_service_origin(target.as_str())
             .map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
         let cached = self.cache.get(&key).map_err(AgentError::Cache)?;
@@ -505,7 +547,7 @@ impl ServiceClient {
         }
         let mut conditional = BTreeMap::new();
         let mut request_target = target;
-        if let Some(record) = &cached {
+        if let Some(record) = cached.as_ref().filter(|_| method == "GET") {
             if let Ok(cached_target) = Url::parse(&record.final_url) {
                 if derive_service_origin(cached_target.as_str())
                     .ok()
@@ -523,7 +565,14 @@ impl ServiceClient {
             }
         }
         let raw = self
-            .request_raw(method, request_target, body, conditional, &request_origin)
+            .request_raw(
+                method,
+                request_target,
+                body,
+                conditional,
+                &request_origin,
+                maximum_bytes,
+            )
             .await?;
         if raw.status == 304 {
             let Some(mut record) = cached else {
@@ -585,8 +634,10 @@ impl ServiceClient {
         mut body: Vec<u8>,
         conditional: BTreeMap<String, String>,
         redirect_origin: &str,
+        maximum_bytes: usize,
     ) -> Result<RawResponse, AgentError> {
-        for redirect in 0..=MAX_REDIRECTS {
+        let mut redirect = 0_usize;
+        loop {
             let mut headers = BTreeMap::from([("accept".to_owned(), MEDIA_TYPE.to_owned())]);
             if let Some(language) = &self.accept_language {
                 headers.insert("accept-language".to_owned(), language.clone());
@@ -597,12 +648,15 @@ impl ServiceClient {
             headers.extend(conditional.clone());
             let response = self
                 .transport
-                .send(HttpRequest {
-                    body: body.clone(),
-                    headers,
-                    method: method.to_owned(),
-                    url: target.to_string(),
-                })
+                .send_limited(
+                    HttpRequest {
+                        body: body.clone(),
+                        headers,
+                        method: method.to_owned(),
+                        url: target.to_string(),
+                    },
+                    maximum_bytes,
+                )
                 .await?;
             if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
                 if redirect == MAX_REDIRECTS {
@@ -628,6 +682,7 @@ impl ServiceClient {
                     body.clear();
                 }
                 target = next;
+                redirect += 1;
                 continue;
             }
             return Ok(RawResponse {
@@ -637,9 +692,6 @@ impl ServiceClient {
                 status: response.status,
             });
         }
-        Err(AgentError::InvalidResponse(
-            "ODP response exceeded its redirect limit".to_owned(),
-        ))
     }
 
     fn cache_key(&self, method: &str, target: &str, body: &[u8]) -> String {
@@ -676,6 +728,10 @@ impl ServiceClient {
             .body)
     }
 
+    pub(crate) const fn cache_fallbacks(&self) -> CacheFallbacks {
+        self.cache_fallbacks
+    }
+
     pub(crate) async fn supporting_json(
         &self,
         target: &str,
@@ -683,23 +739,64 @@ impl ServiceClient {
         accept: &str,
         media_types: &[&str],
         maximum_bytes: usize,
+        fallback: Duration,
     ) -> Result<serde_json::Value, AgentError> {
+        Ok(self
+            .supporting_resource(
+                target,
+                resource_class,
+                accept,
+                media_types,
+                maximum_bytes,
+                fallback,
+            )
+            .await?
+            .value)
+    }
+
+    pub(crate) async fn supporting_resource(
+        &self,
+        target: &str,
+        resource_class: &str,
+        accept: &str,
+        media_types: &[&str],
+        maximum_bytes: usize,
+        fallback: Duration,
+    ) -> Result<SupportingDocument, AgentError> {
         let mut current =
             Url::parse(target).map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
-        if current.scheme() != "https" || current.host_str().is_none() {
+        if current.scheme() != "https"
+            || current.host_str().is_none()
+            || !current.username().is_empty()
+            || current.password().is_some()
+        {
             return Err(AgentError::InvalidRequest(
                 "ODP supporting document URL must use HTTPS".to_owned(),
             ));
         }
-        let key = format!("anonymous:{resource_class}\nGET\n{target}\n{accept}");
+        let key = format!(
+            "{}:{resource_class}\nGET\n{target}\n{accept}",
+            self.cache_partition
+        );
         let cached = self.cache.get(&key).map_err(AgentError::Cache)?;
         let now = SystemTime::now();
         if let Some(record) = &cached {
             if now < record.expires_at {
-                return decode_json_object(&record.body);
+                return supporting_document(&record.body, &record.final_url, resource_class);
             }
         }
-        for redirects in 0..=MAX_REDIRECTS {
+        let mut redirects = 0_usize;
+        if let Some(record) = &cached {
+            if let Ok(final_url) = Url::parse(&record.final_url) {
+                if final_url.origin() == current.origin()
+                    && final_url.username().is_empty()
+                    && final_url.password().is_none()
+                {
+                    current = final_url;
+                }
+            }
+        }
+        loop {
             let mut headers = BTreeMap::from([("accept".to_owned(), accept.to_owned())]);
             if let Some(record) = &cached {
                 if let Some(etag) = &record.etag {
@@ -711,12 +808,15 @@ impl ServiceClient {
             }
             let response = self
                 .supporting_transport
-                .send(HttpRequest {
-                    body: Vec::new(),
-                    headers,
-                    method: "GET".to_owned(),
-                    url: current.to_string(),
-                })
+                .send_limited(
+                    HttpRequest {
+                        body: Vec::new(),
+                        headers,
+                        method: "GET".to_owned(),
+                        url: current.to_string(),
+                    },
+                    maximum_bytes,
+                )
                 .await?;
             if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
                 if redirects == MAX_REDIRECTS {
@@ -732,12 +832,17 @@ impl ServiceClient {
                 let next = current
                     .join(location)
                     .map_err(|error| AgentError::InvalidResponse(error.to_string()))?;
-                if next.scheme() != "https" || next.host_str().is_none() {
+                if next.origin() != current.origin()
+                    || !next.username().is_empty()
+                    || next.password().is_some()
+                {
                     return Err(AgentError::InvalidResponse(
-                        "ODP supporting document redirect must use HTTPS".to_owned(),
+                        "ODP supporting document redirect changed origin or included credentials"
+                            .to_owned(),
                     ));
                 }
                 current = next;
+                redirects += 1;
                 continue;
             }
             if response.status == 304 {
@@ -751,14 +856,14 @@ impl ServiceClient {
                     self.cache.delete(&key).map_err(AgentError::Cache)?;
                 } else {
                     record.expires_at =
-                        revalidated_expiration(&response.headers, &record, Duration::ZERO, now);
+                        revalidated_expiration(&response.headers, &record, fallback, now);
                     record.stored_at = now;
                     record.final_url = current.to_string();
                     self.cache
                         .set(key.clone(), record.clone())
                         .map_err(AgentError::Cache)?;
                 }
-                return decode_json_object(&record.body);
+                return supporting_document(&record.body, &record.final_url, resource_class);
             }
             if !(200..300).contains(&response.status) {
                 return Err(AgentError::Request {
@@ -766,7 +871,13 @@ impl ServiceClient {
                     status: response.status,
                 });
             }
-            if response.body.len() > maximum_bytes {
+            let declared = response
+                .headers
+                .get("content-length")
+                .and_then(|value| value.trim().parse::<usize>().ok());
+            if declared.is_some_and(|value| value > maximum_bytes)
+                || response.body.len() > maximum_bytes
+            {
                 return Err(AgentError::InvalidResponse(
                     "ODP supporting document exceeds its byte limit".to_owned(),
                 ));
@@ -784,8 +895,8 @@ impl ServiceClient {
                     "ODP supporting document has an unsupported media type".to_owned(),
                 ));
             }
-            let document = decode_json_object(&response.body)?;
-            if !cacheable("GET", &response.headers, Duration::ZERO) {
+            let document = supporting_document(&response.body, current.as_str(), resource_class)?;
+            if !cacheable("GET", &response.headers, fallback) {
                 self.cache.delete(&key).map_err(AgentError::Cache)?;
             } else {
                 self.cache
@@ -794,7 +905,7 @@ impl ServiceClient {
                         CacheRecord {
                             body: response.body,
                             etag: response.headers.get("etag").cloned(),
-                            expires_at: expiration(&response.headers, Duration::ZERO, now),
+                            expires_at: expiration(&response.headers, fallback, now),
                             final_url: current.to_string(),
                             last_modified: response.headers.get("last-modified").cloned(),
                             status: response.status,
@@ -805,10 +916,27 @@ impl ServiceClient {
             }
             return Ok(document);
         }
-        Err(AgentError::InvalidResponse(
-            "ODP supporting document exceeded its redirect limit".to_owned(),
-        ))
     }
+}
+
+pub(crate) struct SupportingDocument {
+    pub value: serde_json::Value,
+    pub final_url: String,
+    pub bytes: usize,
+}
+
+fn supporting_document(
+    body: &[u8],
+    final_url: &str,
+    resource_class: &str,
+) -> Result<SupportingDocument, AgentError> {
+    let value = decode_json_object(body)?;
+    odp_core::validate_json_depth(&value, if resource_class == "openapi" { 32 } else { 16 })?;
+    Ok(SupportingDocument {
+        value,
+        final_url: final_url.to_owned(),
+        bytes: body.len(),
+    })
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -822,20 +950,8 @@ fn sha256_hex(data: &[u8]) -> String {
     encoded
 }
 
-fn parse_agent_collection(data: &[u8]) -> Result<Collection, ParseError> {
-    parse_collection(&normalize_agent_response(data, "collection")?)
-}
-
-fn parse_agent_offering(data: &[u8]) -> Result<Offering, ParseError> {
-    parse_offering(&normalize_agent_response(data, "offering")?)
-}
-
 fn parse_agent_collection_page(data: &[u8]) -> Result<Page<Collection>, ParseError> {
     parse_page(&normalize_agent_response(data, "collection-page")?)
-}
-
-fn parse_agent_offering_search_response(data: &[u8]) -> Result<OfferingPage<Offering>, ParseError> {
-    parse_offering_search_response(&normalize_agent_response(data, "offering-page")?)
 }
 
 fn validate_collections(page: Page<Collection>) -> Result<Page<Collection>, AgentError> {
@@ -934,39 +1050,94 @@ struct RawResponse {
 }
 
 fn consume(response: RawResponse, maximum_bytes: usize) -> Result<RawResponse, AgentError> {
-    if response.body.len() > maximum_bytes {
-        return Err(AgentError::InvalidResponse(
-            "ODP response exceeds its byte limit".to_owned(),
-        ));
-    }
-    if !(200..300).contains(&response.status) {
-        let problem = normalize_agent_response(&response.body, "problem")
-            .unwrap_or_else(|_| response.body.clone());
-        let message = parse_problem_response(&problem, response.status)
-            .map(|problem| {
-                if problem.detail.is_empty() {
-                    problem.title
-                } else {
-                    problem.detail
-                }
-            })
-            .unwrap_or_else(|_| String::from_utf8_lossy(&response.body).into_owned());
+    let failed = !(200..300).contains(&response.status);
+    // ERR-21 gives a Problem Details response its own, much smaller limit.
+    let limit = if failed {
+        MAX_PROBLEM_BYTES
+    } else {
+        maximum_bytes
+    };
+    require_within_limit(&response, limit)?;
+    if failed {
         return Err(AgentError::Request {
-            message,
+            message: failure_message(&response),
             status: response.status,
         });
     }
-    let content_type = response
-        .headers
-        .get("content-type")
-        .map(|value| value.split(';').next().unwrap_or_default().trim())
-        .unwrap_or_default();
-    if !content_type.eq_ignore_ascii_case(MEDIA_TYPE) {
+    if !media_type_essence(&response.headers).eq_ignore_ascii_case(MEDIA_TYPE) {
         return Err(AgentError::InvalidResponse(format!(
             "ODP response must use {MEDIA_TYPE}"
         )));
     }
     Ok(response)
+}
+
+/// ERR-20: a body past its limit is refused, and a declared length past it is refused before the
+/// body is read at all.
+fn require_within_limit(response: &RawResponse, limit: usize) -> Result<(), AgentError> {
+    let declared = response
+        .headers
+        .get("content-length")
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    if declared.is_some_and(|value| value > limit) || response.body.len() > limit {
+        return Err(AgentError::InvalidResponse(
+            "ODP response exceeds its byte limit".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Describes a failed request without repeating whatever the response happened to contain.
+///
+/// Only a structured field of an RFC 9457 document is quoted, and only after the control characters
+/// that would let it forge a log line are removed. A body of any other media type says nothing
+/// about the request that this Agent should carry into its own errors.
+fn failure_message(response: &RawResponse) -> String {
+    const ABSENT: &str = "the Service supplied no Problem Details";
+    if !media_type_essence(&response.headers).eq_ignore_ascii_case(PROBLEM_MEDIA_TYPE) {
+        return ABSENT.to_owned();
+    }
+    let Ok(problem) = normalize_agent_response(&response.body, "problem")
+        .and_then(|document| parse_problem_response(&document, response.status))
+    else {
+        return ABSENT.to_owned();
+    };
+    let detail = printable(if problem.detail.is_empty() {
+        &problem.title
+    } else {
+        &problem.detail
+    });
+    if detail.is_empty() {
+        ABSENT.to_owned()
+    } else {
+        detail
+    }
+}
+
+fn media_type_essence(headers: &BTreeMap<String, String>) -> &str {
+    headers
+        .get("content-type")
+        .map(|value| value.split(';').next().unwrap_or_default().trim())
+        .unwrap_or_default()
+}
+
+/// Flattens a quoted string so it cannot forge a log line: a control character becomes a space and
+/// runs of whitespace collapse. Its length needs no bound here, because a document whose `detail`
+/// runs past the ERR-04 limit is not a Problem Details document and is never quoted at all.
+fn printable(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn expiration(
@@ -1277,5 +1448,84 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A supporting document is a JSON object; an array or a scalar is not one.
+    #[test]
+    fn refuses_a_supporting_document_that_is_not_an_object() {
+        for body in [b"[1,2]".as_slice(), b"\"text\"", b"7"] {
+            let error = decode_json_object(body).unwrap_err();
+            assert!(error.to_string().contains("JSON object"), "{error}");
+        }
+        assert!(decode_json_object(b"{}").is_ok());
+    }
+
+    /// ERR-14: a Problem Details body with nothing readable in it is not quoted back.
+    #[test]
+    fn quotes_nothing_from_a_problem_with_no_readable_text() {
+        let absent = "the Service supplied no Problem Details";
+        assert_eq!(
+            failure_message(&problem_response(
+                br#"{"odp_version":"1.0","status":500,"title":"\u0001\u0002"}"#,
+                PROBLEM_MEDIA_TYPE,
+            )),
+            absent,
+            "a title of control characters reads as nothing"
+        );
+        assert_eq!(
+            failure_message(&problem_response(
+                "{\"detail\":\"\\u{a0}\",\"odp_version\":\"1.0\",\"status\":500,\"title\":\"Oh\"}"
+                    .as_bytes(),
+                PROBLEM_MEDIA_TYPE,
+            )),
+            absent,
+            "a detail of nothing but spacing reads as nothing"
+        );
+        assert_eq!(
+            failure_message(&problem_response(b"not json", PROBLEM_MEDIA_TYPE)),
+            absent
+        );
+        assert_eq!(
+            failure_message(&problem_response(b"{}", "text/plain")),
+            absent
+        );
+    }
+
+    fn problem_response(body: &[u8], media_type: &str) -> RawResponse {
+        RawResponse {
+            body: body.to_vec(),
+            final_url: "https://plants.example/odp/offerings".to_owned(),
+            headers: BTreeMap::from([("content-type".to_owned(), media_type.to_owned())]),
+            status: 500,
+        }
+    }
+
+    /// SEC-05: a supporting document is fetched over HTTPS, and the check precedes the request.
+    #[tokio::test]
+    async fn refuses_a_supporting_target_that_is_not_https() {
+        let transport = Arc::new(MockTransport {
+            responses: Mutex::new(VecDeque::new()),
+        });
+        let client = ServiceClient::with_transport("https://plants.example", transport.clone())
+            .unwrap()
+            .with_supporting_transport(transport.clone());
+
+        for target in [
+            "http://localhost:8080/schema.json",
+            "http://plants.example/s.json",
+        ] {
+            let error = client
+                .supporting_json(
+                    target,
+                    "attribute-schema",
+                    "application/schema+json",
+                    &["application/schema+json"],
+                    1024,
+                    Duration::from_secs(60),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("HTTPS"), "{target}: {error}");
+        }
     }
 }

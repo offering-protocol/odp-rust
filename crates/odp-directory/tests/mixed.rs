@@ -185,7 +185,10 @@ async fn isolates_malformed_known_items_and_normalizes_future_operations() {
         panic!("collection")
     };
     assert_eq!(item.service.operations.len(), 2);
-    assert!(!item.service.additional.contains_key("http"));
+    assert_eq!(
+        item.service.additional.get("http"),
+        Some(&json!({"endpoint_base":"https://untrusted.example"}))
+    );
 }
 
 #[tokio::test]

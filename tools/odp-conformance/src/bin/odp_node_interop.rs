@@ -6,7 +6,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service_url = std::env::args()
         .nth(1)
         .ok_or("usage: odp-node-interop SERVICE_URL")?;
-    let client = ServiceClient::new(&service_url)?;
+    let client = ServiceClient::for_local_development(&service_url)?;
     let inspection = client.inspect().await?;
     if inspection.document.name != "Small Example Store" {
         return Err(format!("unexpected Service {:?}", inspection.document.name).into());

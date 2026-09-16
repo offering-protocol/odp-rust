@@ -97,6 +97,18 @@ async fn evaluate_case(
 ) -> Result<Option<bool>, String> {
     let valid = field::<bool>(case, "valid").unwrap_or(false);
     match subject {
+        "protocol-version" => {
+            let received: String = required(case, "received")?;
+            let compatible: bool = required(case, "compatible")?;
+            let document = serde_json::json!({"odp_version": received,"name":"Conformance","description":"Conformance","language":"en","localizations":["en"],"http":{"endpoint_base":"/odp"},"operations":[{"name":"list-offerings","authentication":"not-required"},{"name":"get-offering","authentication":"not-required"}]});
+            Ok(Some(
+                parse_service_document(
+                    &serde_json::to_vec(&document).map_err(|error| error.to_string())?,
+                )
+                .is_ok()
+                    == compatible,
+            ))
+        }
         "local-identifier" => {
             let value: String = required(case, "value")?;
             Ok(Some(is_local_resource_identifier(&value) == valid))
@@ -145,7 +157,7 @@ async fn evaluate_case(
             parse_result(case, "sort", parse_sort_definition)
         }
         "filter-sort-contract" => Ok(None),
-        "pagination-contract" => evaluate_pagination(case),
+        "pagination-contract" => evaluate_pagination(case).await,
         "errors-limits-contract" => evaluate_errors_and_limits(case).await,
         "role-baseline" => evaluate_baseline(case, role),
         _ => Ok(None),
@@ -451,13 +463,25 @@ async fn attribute_schema_details(
     Ok((details, supporting_transport.calls.load(Ordering::Relaxed)))
 }
 
-fn evaluate_pagination(case: &BTreeMap<String, Value>) -> Result<Option<bool>, String> {
+async fn evaluate_pagination(case: &BTreeMap<String, Value>) -> Result<Option<bool>, String> {
     let valid = field::<bool>(case, "valid").unwrap_or(false);
     match operation(case).as_str() {
         "validate-page" => parse_result(case, "page", parse_page::<Value>),
         "validate-limit" => {
             let limit: usize = required(case, "limit")?;
-            Ok(Some((1..=100).contains(&limit) == valid))
+            let service =
+                odp_service::ServiceBuilder::new("Conformance", "Conformance", "en", "/odp")
+                    .build(Arc::new(ConformanceCatalog))
+                    .map_err(|error| error.to_string())?;
+            let response = service
+                .handle(Request {
+                    method: "GET".to_owned(),
+                    path: "/odp/offerings".to_owned(),
+                    query: format!("limit={limit}"),
+                    ..Request::default()
+                })
+                .await;
+            Ok(Some((response.status == 200) == valid))
         }
         "validate-next" => {
             let next: String = required(case, "next")?;

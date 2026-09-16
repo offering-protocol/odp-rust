@@ -46,6 +46,20 @@ is validated. `ServiceClient` uses an in-memory cache by default; callers can in
 set an authentication-aware cache partition, or override the Service Document, Collection, and
 Offering fallback lifetimes.
 
+Each client has an isolated cache partition, including when sharing a `Cache`. Use
+`with_cache_partition` only to share responses between clients with the same authentication context.
+Manual `continue_offerings` and `continue_collections` calls use HTTP freshness headers without a
+fallback lifetime: an opaque continuation URL does not identify whether it originated in a search.
+The automatic traversal methods retain the originating operation's fallback policy.
+
+`ServiceClient::new` permits public destinations only. Use `ServiceClient::for_local_development`
+for localhost examples. The default transport pins validated addresses for each request, disables
+proxies, and checks the connected peer. An injected transport owns its network policy; wrapping it
+in `SecureTransport` requires implementing `Transport::send_to` with equivalent address pinning and
+peer verification. Its default implementation refuses the request rather than silently bypassing
+those checks. Implement `send_limited` to enforce response limits while streaming; its default
+implementation can only check the completed response.
+
 `get_offering_details` bundles an Offering with its validated Attribute Schema, validates the
 Offering attributes, and normalizes usable Action targets. `resolve_action` resolves an Action's
 request schema or unique OpenAPI 3.1 operation without invoking the target. Supporting documents
@@ -54,6 +68,8 @@ resolution accepts JSON Schema Draft 2020-12 and is limited to 256 KiB per docum
 eight reference levels, and one MiB for the complete graph. OpenAPI documents are limited to one
 MiB. These are fixed SDK safety ceilings. Cross-document schema composition uses `$ref`;
 `$dynamicRef` accepts only a fragment reference such as `#node`.
+Returned schemas include their referenced resources in `$defs` with absolute identifiers, so a
+caller can use them without additional network access.
 
 ## Search across Services
 

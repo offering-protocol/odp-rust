@@ -74,6 +74,15 @@ impl StaticCatalog {
                 )));
             }
         }
+        let mut depths = BTreeMap::new();
+        for id in collection_by_id.keys() {
+            collection_depth(
+                id,
+                &collection_by_id,
+                &mut depths,
+                &mut std::collections::BTreeSet::new(),
+            )?;
+        }
         Ok(Self {
             collections: options.collections,
             collection_by_id,
@@ -82,6 +91,37 @@ impl StaticCatalog {
             continuation_key,
         })
     }
+}
+
+fn collection_depth(
+    id: &str,
+    collections: &BTreeMap<String, Collection>,
+    depths: &mut BTreeMap<String, usize>,
+    visiting: &mut std::collections::BTreeSet<String>,
+) -> Result<usize, ServiceError> {
+    if let Some(depth) = depths.get(id) {
+        return Ok(*depth);
+    }
+    if visiting.len() > 32 || !visiting.insert(id.to_owned()) {
+        return Err(ServiceError::InvalidConfiguration(
+            "Collection hierarchy contains a cycle or exceeds 32 edges".to_owned(),
+        ));
+    }
+    let collection = collections.get(id).ok_or_else(|| {
+        ServiceError::InvalidConfiguration(format!("Unknown parent Collection {id}"))
+    })?;
+    let mut depth = 0;
+    for parent in &collection.parent_ids {
+        depth = depth.max(1 + collection_depth(parent, collections, depths, visiting)?);
+    }
+    visiting.remove(id);
+    if depth > 32 {
+        return Err(ServiceError::InvalidConfiguration(
+            "Collection hierarchy exceeds 32 edges".to_owned(),
+        ));
+    }
+    depths.insert(id.to_owned(), depth);
+    Ok(depth)
 }
 
 #[async_trait]
@@ -164,11 +204,11 @@ impl Catalog for StaticCatalog {
         request: CatalogRequest,
     ) -> Result<OfferingPage<Offering>, ServiceError> {
         if !self.collection_by_id.contains_key(collection_id) {
-            return Err(ServiceError::Request {
-                code: "NOT_FOUND",
-                message: "Collection not found".to_owned(),
-                status: 404,
-            });
+            return Err(ServiceError::request(
+                404,
+                "NOT_FOUND",
+                "Collection not found",
+            ));
         }
         let offerings = self
             .offerings
@@ -232,7 +272,10 @@ fn offering_representation(
     embedded: bool,
 ) -> Offering {
     if representation == odp_core::Representation::Terse {
+        // OFR-55: a Terse Offering carries no Actions, but it may still point at them.
         value.actions.clear();
+    } else {
+        // REP-12: a Full Representation omits nothing, so it has nothing to point at.
         value.detail_fields.clear();
     }
     if embedded && representation == odp_core::Representation::Terse {
@@ -246,7 +289,8 @@ fn collection_representation(
     representation: odp_core::Representation,
     embedded: bool,
 ) -> Collection {
-    if representation == odp_core::Representation::Terse {
+    if representation != odp_core::Representation::Terse {
+        // REP-12: a Full Representation omits nothing, so it has nothing to point at.
         value.detail_fields.clear();
     }
     if embedded && representation == odp_core::Representation::Terse {
@@ -312,8 +356,10 @@ fn decode_cursor(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| invalid_cursor())?
         .as_secs();
-    if value.expires < now
-        || value.limit != limit
+    if value.expires < now {
+        return Err(expired_cursor());
+    }
+    if value.limit != limit
         || value.path != request.path
         || value.representation != representation_name(request)
     {
@@ -323,11 +369,17 @@ fn decode_cursor(
 }
 
 fn invalid_cursor() -> ServiceError {
-    ServiceError::Request {
-        code: "CONTINUATION_UNAVAILABLE",
-        message: "Continuation is unavailable".to_owned(),
-        status: 410,
-    }
+    ServiceError::request(
+        410,
+        "CONTINUATION_UNAVAILABLE",
+        "Continuation is unavailable",
+    )
+}
+
+/// PAG-20: a continuation that simply aged out is named as such, so an Agent can tell a stale
+/// cursor from one that was never valid and restart the traversal deliberately.
+fn expired_cursor() -> ServiceError {
+    ServiceError::request(410, "CONTINUATION_EXPIRED", "Continuation has expired")
 }
 
 fn representation_name(request: &CatalogRequest) -> &'static str {
@@ -367,6 +419,99 @@ mod tests {
             .as_bytes(),
         )
         .unwrap()
+    }
+
+    /// PAG-19 and PAG-20: a continuation stays usable for an hour, and a stale one is named
+    /// as stale so an Agent can restart the traversal rather than guess.
+    #[tokio::test]
+    async fn distinguishes_a_stale_continuation_from_an_invalid_one() {
+        let catalog = StaticCatalog::new(StaticCatalogOptions {
+            collections: Vec::new(),
+            offerings: vec![offering("one"), offering("two")],
+        })
+        .unwrap();
+        let request = CatalogRequest {
+            limit: 1,
+            path: "/odp/offerings".to_owned(),
+            ..CatalogRequest::default()
+        };
+
+        // A cursor this catalog signed, but issued an hour and a second ago.
+        let stale = Cursor {
+            expires: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - 1,
+            limit: 1,
+            offset: 1,
+            path: request.path.clone(),
+            representation: "terse".to_owned(),
+        };
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&stale).unwrap());
+        let mut mac = Hmac::<Sha256>::new_from_slice(&catalog.continuation_key).unwrap();
+        mac.update(payload.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+
+        let error = catalog
+            .list_offerings(CatalogRequest {
+                cursor: Some(format!("{payload}.{signature}")),
+                ..request.clone()
+            })
+            .await
+            .unwrap_err();
+        let ServiceError::Request { code, status, .. } = error else {
+            panic!("a stale continuation is a request failure");
+        };
+        assert_eq!(status, 410);
+        assert_eq!(code, "CONTINUATION_EXPIRED");
+
+        // One that is simply unusable reads differently, so the two are never confused.
+        let error = catalog
+            .list_offerings(CatalogRequest {
+                cursor: Some("nonsense".to_owned()),
+                ..request
+            })
+            .await
+            .unwrap_err();
+        let ServiceError::Request { code, .. } = error else {
+            panic!("an unusable continuation is a request failure");
+        };
+        assert_eq!(code, "CONTINUATION_UNAVAILABLE");
+    }
+
+    /// REP-12: a Full Collection omits nothing, so it points at nothing.
+    #[tokio::test]
+    async fn keeps_collection_detail_fields_on_the_terse_representation() {
+        let collection = odp_core::parse_collection(
+            br#"{"detail_fields":["/description"],"id":"plants","name":"Plants","odp_version":"1.0"}"#,
+        )
+        .unwrap();
+        let catalog = StaticCatalog::new(StaticCatalogOptions {
+            collections: vec![collection],
+            offerings: Vec::new(),
+        })
+        .unwrap();
+
+        let terse = catalog
+            .get_collection("plants", CatalogRequest::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terse.detail_fields, ["/description"]);
+
+        let full = catalog
+            .get_collection(
+                "plants",
+                CatalogRequest {
+                    representation: odp_core::Representation::Full,
+                    ..CatalogRequest::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(full.detail_fields.is_empty());
     }
 
     #[tokio::test]

@@ -1,7 +1,5 @@
-use std::{net::IpAddr, str::FromStr};
-
 use thiserror::Error;
-use url::Url;
+use url::{Host, Url};
 
 use crate::Operation;
 
@@ -140,9 +138,13 @@ fn parse_url(value: &str) -> Result<Url, ReferenceError> {
 }
 
 fn require_secure_url(url: &Url) -> Result<(), ReferenceError> {
-    let host = url.host_str().ok_or(ReferenceError::MissingHost)?;
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || IpAddr::from_str(host).is_ok_and(|address| address.is_loopback());
+    // `host_str` spells an IPv6 literal with its brackets, which is not an address any parser
+    // reads, so the host is taken apart rather than parsed back out of its URL spelling.
+    let loopback = match url.host().ok_or(ReferenceError::MissingHost)? {
+        Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+    };
     if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
         return Err(ReferenceError::InsecureUrl);
     }
