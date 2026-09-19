@@ -42,7 +42,7 @@ EOF
 cat > "$consumer/src/main.rs" <<'EOF'
 use odp_agent::ServiceClient;
 use odp_core::{Representation, ResourceIdentity, ResourceType};
-use odp_directory::{DirectoryClient, Environment};
+use odp_directory::{DirectoryClient, Environment, ResourceSearchRequest, ResultType};
 use odp_service::ServiceBuilder;
 
 fn main() {
@@ -53,6 +53,10 @@ fn main() {
         "rubber-plant",
     );
     let _ = DirectoryClient::new(Environment::Production);
+    let _ = ResourceSearchRequest {
+        types: Some(vec![ResultType::Collection]),
+        ..Default::default()
+    };
     let _ = ServiceBuilder::new("Example", "Example Service", "en", "/odp");
     let _ = Representation::Terse;
 }
