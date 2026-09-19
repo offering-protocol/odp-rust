@@ -6,8 +6,9 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
-    DirectoryService, Environment, HttpRequest, HttpResponse, IterationOptions, SearchPage,
-    SearchRequest, SuggestionRequest, Transport, TransportError, default_transport,
+    DirectoryService, Environment, HttpRequest, HttpResponse, IterationOptions,
+    ResourceSearchRequest, SearchPage, SearchRequest, SearchResponse, SuggestionRequest, Transport,
+    TransportError, default_transport,
 };
 
 const MAXIMUM_REDIRECTS: usize = 5;
@@ -54,7 +55,35 @@ impl DirectoryClient {
         self.environment
     }
 
-    pub async fn search(&self, request: &SearchRequest) -> Result<SearchPage, DirectoryError> {
+    pub async fn search(
+        &self,
+        request: &ResourceSearchRequest,
+    ) -> Result<SearchResponse, DirectoryError> {
+        validate_search(&request.query, request.limit, request.filters.as_ref())?;
+        if let Some(types) = &request.types {
+            if types.is_empty() || types.len() > 2 || (types.len() == 2 && types[0] == types[1]) {
+                return Err(DirectoryError::InvalidRequest(
+                    "types must contain distinct service or collection values".to_owned(),
+                ));
+            }
+        }
+        let body = serde_json::to_vec(request)
+            .map_err(|error| DirectoryError::InvalidRequest(error.to_string()))?;
+        let target = self.continuation_url("/v1/directory/search")?;
+        let response = self.request("POST", target, body).await?;
+        crate::results::decode(&response.body)
+    }
+
+    pub async fn continue_search(&self, next: &str) -> Result<SearchResponse, DirectoryError> {
+        let target = self.continuation_url(next)?;
+        let response = self.request("GET", target, Vec::new()).await?;
+        crate::results::decode(&response.body)
+    }
+
+    pub async fn search_services(
+        &self,
+        request: &SearchRequest,
+    ) -> Result<SearchPage, DirectoryError> {
         validate_search_request(request)?;
         let body = serde_json::to_vec(request)
             .map_err(|error| DirectoryError::InvalidRequest(error.to_string()))?;
@@ -66,46 +95,50 @@ impl DirectoryClient {
         .await
     }
 
-    pub async fn continue_search(&self, next: &str) -> Result<SearchPage, DirectoryError> {
+    pub async fn continue_search_services(&self, next: &str) -> Result<SearchPage, DirectoryError> {
         let target = self.continuation_url(next)?;
         self.request_page("GET", target.as_str(), Vec::new()).await
     }
 
-    pub async fn search_pages(
-        &self,
-        request: &SearchRequest,
-        options: IterationOptions,
-    ) -> Result<Vec<SearchPage>, DirectoryError> {
-        let maximum_pages = bounded(options.max_pages, 16, 16, "max_pages")?;
-        let mut pages = Vec::new();
-        let mut page = self.search(request).await?;
-        for _ in 0..maximum_pages {
-            let next = page.next.clone();
-            pages.push(page);
-            if next.is_empty() {
-                return Ok(pages);
-            }
-            page = self.continue_search(&next).await?;
-        }
-        Ok(pages)
-    }
-
-    pub async fn search_services(
+    pub async fn collect_services(
         &self,
         request: &SearchRequest,
         options: IterationOptions,
     ) -> Result<Vec<DirectoryService>, DirectoryError> {
         let maximum_items = bounded(options.max_items, 10_000, 10_000, "max_items")?;
-        let pages = self.search_pages(request, options).await?;
-        Ok(pages
-            .into_iter()
-            .flat_map(|page| page.items)
-            .take(maximum_items)
-            .collect())
+        let maximum_responses = bounded(options.max_pages, 16, 16, "max_pages")?;
+        let mut services = Vec::new();
+        let mut page = self.search_services(request).await?;
+        for index in 0..maximum_responses {
+            services.extend(page.items.into_iter().take(maximum_items - services.len()));
+            if page.next.is_empty()
+                || services.len() == maximum_items
+                || index + 1 == maximum_responses
+            {
+                break;
+            }
+            page = self.continue_search_services(&page.next).await?;
+        }
+        Ok(services)
     }
 
     pub async fn suggest(
         &self,
+        request: &SuggestionRequest,
+    ) -> Result<Vec<String>, DirectoryError> {
+        self.suggestions("/v1/directory/suggestions", request).await
+    }
+
+    pub async fn suggest_services(
+        &self,
+        request: &SuggestionRequest,
+    ) -> Result<Vec<String>, DirectoryError> {
+        self.suggestions("/v1/services/suggestions", request).await
+    }
+
+    async fn suggestions(
+        &self,
+        path: &str,
         request: &SuggestionRequest,
     ) -> Result<Vec<String>, DirectoryError> {
         let prefix = request.prefix.trim();
@@ -119,11 +152,8 @@ impl DirectoryClient {
                 "limit must be from 1 through 25".to_owned(),
             ));
         }
-        let mut target = Url::parse(&format!(
-            "{}/v1/services/suggestions",
-            self.environment.origin()
-        ))
-        .map_err(|error| DirectoryError::InvalidRequest(error.to_string()))?;
+        let mut target = Url::parse(&format!("{}{}", self.environment.origin(), path))
+            .map_err(|error| DirectoryError::InvalidRequest(error.to_string()))?;
         target.query_pairs_mut().append_pair("prefix", prefix);
         if request.limit != 0 {
             target
@@ -131,8 +161,13 @@ impl DirectoryClient {
                 .append_pair("limit", &request.limit.to_string());
         }
         let response = self.request("GET", target, Vec::new()).await?;
-        let suggestions = serde_json::from_slice::<Vec<String>>(&response.body)
-            .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
+        #[derive(serde::Deserialize)]
+        struct Suggestions {
+            items: Vec<String>,
+        }
+        let suggestions = serde_json::from_slice::<Suggestions>(&response.body)
+            .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?
+            .items;
         if suggestions.len() > 25
             || suggestions.iter().any(|value| {
                 value.trim() != value || value.is_empty() || value.chars().count() > 128
@@ -247,6 +282,11 @@ impl DirectoryClient {
     }
 
     fn continuation_url(&self, next: &str) -> Result<Url, DirectoryError> {
+        if next.trim().is_empty() {
+            return Err(DirectoryError::InvalidRequest(
+                "Directory continuation is empty".to_owned(),
+            ));
+        }
         let origin = Url::parse(self.environment.origin())
             .map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
         let target = origin
@@ -316,17 +356,25 @@ fn bounded(
 }
 
 fn validate_search_request(request: &SearchRequest) -> Result<(), DirectoryError> {
-    if request.limit > 100 {
+    validate_search(&request.query, request.limit, request.filters.as_ref())
+}
+
+fn validate_search(
+    query: &str,
+    limit: usize,
+    filters: Option<&crate::ServiceFilters>,
+) -> Result<(), DirectoryError> {
+    if limit > 100 {
         return Err(DirectoryError::InvalidRequest(
             "limit must be from 1 through 100".to_owned(),
         ));
     }
-    if request.query.trim() != request.query || request.query.chars().count() > 512 {
+    if query.trim() != query || query.chars().count() > 512 {
         return Err(DirectoryError::InvalidRequest(
             "query must contain at most 512 characters without surrounding whitespace".to_owned(),
         ));
     }
-    if let Some(filters) = &request.filters {
+    if let Some(filters) = filters {
         if filters.keywords.len() > 32
             || filters
                 .keywords
@@ -423,7 +471,7 @@ mod tests {
         });
         let client = DirectoryClient::with_transport(Environment::Sandbox, transport.clone());
         let page = client
-            .search(&SearchRequest {
+            .search_services(&SearchRequest {
                 filters: Some(ServiceFilters {
                     trust: vec![odp_core::TrustProtocol {
                         name: odp_core::Protocol::Tap,
@@ -462,7 +510,10 @@ mod tests {
             Arc::new(ResponseTransport(body.to_vec())),
         );
 
-        let page = client.search(&SearchRequest::default()).await.unwrap();
+        let page = client
+            .search_services(&SearchRequest::default())
+            .await
+            .unwrap();
 
         assert_eq!(
             page.facets.unwrap().trust,
@@ -479,7 +530,12 @@ mod tests {
             Environment::Production,
             Arc::new(ResponseTransport(invalid.to_vec())),
         );
-        assert!(client.search(&SearchRequest::default()).await.is_err());
+        assert!(
+            client
+                .search_services(&SearchRequest::default())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -491,7 +547,7 @@ mod tests {
             }),
         );
         let error = client
-            .search_services(
+            .collect_services(
                 &SearchRequest::default(),
                 IterationOptions {
                     max_items: 10_001,
@@ -512,7 +568,7 @@ mod tests {
             }),
         );
         let error = client
-            .search(&SearchRequest {
+            .search_services(&SearchRequest {
                 filters: Some(ServiceFilters {
                     trust: vec![odp_core::TrustProtocol {
                         name: odp_core::Protocol::Mpp,
@@ -533,7 +589,10 @@ mod tests {
             Environment::Production,
             Arc::new(ResponseTransport(body.to_vec())),
         );
-        let page = client.search(&SearchRequest::default()).await.unwrap();
+        let page = client
+            .search_services(&SearchRequest::default())
+            .await
+            .unwrap();
         let protocols = page.items[0].protocols.as_ref().unwrap();
         assert_eq!(protocols.payments.len(), 1);
         assert_eq!(protocols.trust.len(), 1);
@@ -544,6 +603,11 @@ mod tests {
             Environment::Production,
             Arc::new(ResponseTransport(malformed.into_bytes())),
         );
-        assert!(client.search(&SearchRequest::default()).await.is_err());
+        assert!(
+            client
+                .search_services(&SearchRequest::default())
+                .await
+                .is_err()
+        );
     }
 }

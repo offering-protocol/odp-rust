@@ -2,6 +2,7 @@
 
 mod client;
 mod models;
+mod results;
 mod transport;
 
 pub use client::*;
