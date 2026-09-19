@@ -21,6 +21,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true
+# yoke-derive 0.8.3 does not compile on Rust 1.85; constrain consumer resolution too.
+yoke-derive = "=0.8.2"
 
 [lints]
 workspace = true

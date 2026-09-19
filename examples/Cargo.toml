@@ -24,5 +24,9 @@ path = "odp-agent-discovery/main.rs"
 name = "odp-service-small"
 path = "odp-service-small/main.rs"
 
+[[bin]]
+name = "odp-directory-discovery"
+path = "odp-directory-discovery/main.rs"
+
 [lints]
 workspace = true

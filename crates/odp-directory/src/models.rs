@@ -67,6 +67,83 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResultType {
+    Service,
+    Collection,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ResourceSearchRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<ServiceFilters>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub limit: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub types: Option<Vec<ResultType>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DirectoryResult {
+    Service(Box<ServiceResult>),
+    Collection(Box<CollectionResult>),
+    Unknown { kind: String, raw: Value },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ServiceResult {
+    pub service: DirectoryService,
+    pub indexed_at: String,
+    pub available_through: Option<ServiceReference>,
+    #[serde(flatten)]
+    pub additional: AdditionalMembers,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct CollectionResult {
+    pub service: DirectoryService,
+    pub indexed_at: String,
+    pub collection: CollectionSummary,
+    #[serde(flatten)]
+    pub additional: AdditionalMembers,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ServiceReference {
+    pub service_id: String,
+    pub service_origin: String,
+    pub name: Option<String>,
+    #[serde(flatten)]
+    pub additional: AdditionalMembers,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct CollectionSummary {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(flatten)]
+    pub additional: AdditionalMembers,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DirectoryIssue {
+    pub index: usize,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchResponse {
+    pub facets: Option<Facets>,
+    pub items: Vec<DirectoryResult>,
+    pub next: Option<String>,
+    pub issues: Vec<DirectoryIssue>,
+    pub additional: AdditionalMembers,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct DirectoryService {
     pub description: String,
@@ -90,6 +167,12 @@ pub struct DirectoryService {
     pub website_url: String,
     #[serde(flatten)]
     pub additional: AdditionalMembers,
+}
+
+impl DirectoryService {
+    pub fn service_id(&self) -> Option<&str> {
+        self.additional.get("service_id").and_then(Value::as_str)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -131,8 +214,11 @@ pub struct SearchPage {
     pub additional: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SuggestionRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<ServiceFilters>,
+    #[serde(skip_serializing_if = "is_zero")]
     pub limit: usize,
     pub prefix: String,
 }

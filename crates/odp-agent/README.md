@@ -57,6 +57,11 @@ MiB. These are fixed SDK safety ceilings. Cross-document schema composition uses
 
 ## Search across Services
 
+Federated discovery uses `DirectoryClient::collect_services` and remains Service-only. For mixed
+discovery, use `DirectoryClient::search`, inspect each Collection result's owning Service, then
+call `ServiceClient::get_collection` with its Collection ID. Collection results are not separate
+Services. See the [Directory guide](../odp-directory/README.md#search-services-and-collections).
+
 ```rust,no_run
 use odp_agent::{Agent, FederatedSearchRequest};
 use odp_core::{OfferingSearchRequest, VERSION};
