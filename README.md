@@ -12,6 +12,12 @@ ODP separates Service discovery from catalog discovery. An Agent searches the ca
 for candidate Services, inspects each Service's live ODP document, and then navigates or searches
 that Service's Collections and Offerings.
 
+`DirectoryClient::search` discovers indexed Services and submitted Collections. Use
+`search_services` for a Service-only response or `collect_services` for bounded Service-only
+aggregation. `suggest` returns mixed target names; `suggest_services` returns Service-only
+keyword suggestions. See the [Directory guide](./crates/odp-directory/README.md) for result types,
+the 100-result cap, and migration from the earlier method names.
+
 ## Workspace
 
 | Goal                                               | Crate           | Guide                                      |

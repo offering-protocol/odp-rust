@@ -76,7 +76,7 @@ impl Agent {
         let concurrency = bounded(request.concurrency, 4, 16, "concurrency")?;
         let services = self
             .directory
-            .search_services(
+            .collect_services(
                 &request.services,
                 IterationOptions {
                     max_items: maximum_services,
