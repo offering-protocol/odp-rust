@@ -176,6 +176,9 @@ impl ServiceClient {
                 "application/vnd.oai.openapi+json;version=3.1, application/json;q=0.9",
                 &["application/vnd.oai.openapi+json", "application/json"],
                 MAXIMUM_OPENAPI_BYTES,
+                // CCH-02 names no fallback for an OpenAPI document, so one is only cached when the
+                // Service says how long it stays fresh.
+                std::time::Duration::ZERO,
             )
             .await?;
         let version = document
@@ -342,5 +345,49 @@ mod tests {
             actions[0].http.as_ref().map(|value| value.url.as_str()),
             Some("https://plants.example/downloads/plant.pdf")
         );
+    }
+
+    /// The Offering schema keeps these shapes out of a parsed document, so they are checked
+    /// here: the helpers also run against a Service Origin, which no schema validates.
+    #[test]
+    fn refuses_an_action_target_that_is_not_an_http_url() {
+        for reference in ["mailto:sales@plants.example", "file:///etc/passwd"] {
+            let error = resolve_http_reference(reference, "https://plants.example").unwrap_err();
+            assert!(error.to_string().contains("HTTP"), "{reference}: {error}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_supporting_document_that_is_not_served_over_https() {
+        let error =
+            resolve_https_reference("http://plants.example/s.json", "https://plants.example")
+                .unwrap_err();
+        assert!(error.to_string().contains("HTTPS"), "{error}");
+    }
+
+    #[test]
+    fn refuses_a_reference_it_has_no_base_for() {
+        let error = resolve_http_reference("/plants", "not a base").unwrap_err();
+        assert!(matches!(error, AgentError::InvalidRequest(_)), "{error}");
+    }
+
+    /// An Action describing no target at all is passed over quietly: there is nothing to call.
+    #[test]
+    fn passes_over_an_action_that_names_no_target() {
+        let action = Action {
+            authentication: AuthenticationRequirement::NotRequired,
+            description: "Ask us".to_owned(),
+            http: None,
+            id: "ask".to_owned(),
+            openapi: None,
+            rel: ActionRelation::Other("contact".to_owned()),
+        };
+        let (actions, issues) = normalize_actions(
+            std::slice::from_ref(&action),
+            "https://plants.example",
+            "https://plants.example/openapi.json",
+        );
+        assert!(actions.is_empty());
+        assert!(issues.is_empty());
     }
 }

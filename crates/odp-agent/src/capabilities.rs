@@ -6,7 +6,7 @@ use odp_core::{
 };
 use url::Url;
 
-use crate::{AgentError, CacheFallbacks, ServiceClient};
+use crate::{AgentError, ServiceClient};
 
 const MAXIMUM_CAPABILITY_PAGES: usize = 16;
 const MAXIMUM_FILTERS: usize = 1_024;
@@ -272,7 +272,7 @@ impl ServiceClient {
             let data = self
                 .linked_odp(
                     target,
-                    CacheFallbacks::default().collection,
+                    self.cache_fallbacks().capabilities,
                     validate_filter_page,
                 )
                 .await?;
@@ -307,7 +307,7 @@ impl ServiceClient {
             let data = self
                 .linked_odp(
                     target,
-                    CacheFallbacks::default().collection,
+                    self.cache_fallbacks().capabilities,
                     validate_sort_page,
                 )
                 .await?;
@@ -418,5 +418,20 @@ mod tests {
         assert!(catalog.issues.is_empty());
         assert_eq!(catalog.filters["price"].title, "Price");
         assert_eq!(catalog.sorts["price-lowest"].filters[0].id, "price");
+    }
+
+    /// A validated document never carries one, so the helper's own guard is checked here.
+    #[test]
+    fn refuses_a_capability_reference_that_is_not_an_http_url() {
+        for reference in ["mailto:filters@plants.example", "file:///filters.json"] {
+            let error = resolve_reference(reference, "https://plants.example").unwrap_err();
+            assert!(error.to_string().contains("HTTP"), "{reference}: {error}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_capability_reference_it_has_no_base_for() {
+        let error = resolve_reference("/filters", "not a base").unwrap_err();
+        assert!(matches!(error, AgentError::InvalidRequest(_)), "{error}");
     }
 }

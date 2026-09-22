@@ -184,7 +184,7 @@ mod tests {
     impl Transport for ServiceTransport {
         async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
             if request.url.ends_with("/.well-known/odp") {
-                return Ok(odp_response(br#"{"description":"Plants","http":{"endpoint_base":"/odp"},"language":"en","localizations":["en"],"name":"Plants","odp_version":"1.0","operations":[{"authentication":"not-required","name":"get-offering"},{"authentication":"not-required","name":"list-offerings"}]}"#));
+                return Ok(odp_response(br#"{"description":"Plants","http":{"endpoint_base":"/odp"},"language":"en","localizations":["en"],"name":"Plants","odp_version":"1.0","operations":[{"authentication":"not-required","name":"get-offering"},{"authentication":"not-required","name":"list-offerings"},{"authentication":"not-required","name":"search-offerings"}]}"#));
             }
             let id = if request.url.starts_with("https://one.example") {
                 "one"
@@ -242,5 +242,151 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].service.name, "One");
         assert_eq!(events[1].service.name, "Two");
+    }
+
+    /// A search request drives the search operation; a bare request just lists.
+    #[tokio::test]
+    async fn searches_a_service_only_when_the_request_asks_a_question() {
+        let recorder = Arc::new(RecordingFactory::default());
+        let directory =
+            DirectoryClient::with_transport(Environment::Production, Arc::new(DirectoryTransport));
+        let agent = Agent::with_clients(directory, recorder.clone());
+
+        agent
+            .search_offerings_across_services(&FederatedSearchRequest {
+                offerings: OfferingSearchRequest {
+                    query: "rubber".to_owned(),
+                    ..OfferingSearchRequest::default()
+                },
+                ..FederatedSearchRequest::default()
+            })
+            .await
+            .unwrap();
+
+        let urls = recorder.urls();
+        assert!(
+            urls.iter().any(|url| url.contains("/offerings/search")),
+            "{urls:?}"
+        );
+    }
+
+    /// FED-04: one Service that cannot answer is reported, and the others still report offerings.
+    #[tokio::test]
+    async fn reports_a_failing_service_without_losing_the_others() {
+        struct HalfBroken;
+
+        impl ServiceClientFactory for HalfBroken {
+            fn create(&self, service: &DirectoryService) -> Result<ServiceClient, AgentError> {
+                if service.service_origin.starts_with("https://one.example") {
+                    return Err(AgentError::InvalidRequest("no client for One".to_owned()));
+                }
+                ServiceClient::with_transport(&service.service_origin, Arc::new(ServiceTransport))
+            }
+        }
+
+        let directory =
+            DirectoryClient::with_transport(Environment::Production, Arc::new(DirectoryTransport));
+        let agent = Agent::with_clients(directory, Arc::new(HalfBroken));
+        let events = agent
+            .search_offerings_across_services(&FederatedSearchRequest::default())
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].service.name, "One");
+        assert!(events[0].offering.is_none());
+        assert!(events[0].issue.is_some());
+        assert!(events[1].offering.is_some());
+        assert!(events[1].issue.is_none());
+    }
+
+    /// Each bound has a ceiling, so a request asking for more is refused before anything is sent.
+    #[tokio::test]
+    async fn refuses_a_request_that_asks_for_more_than_the_bounds_allow() {
+        let directory =
+            DirectoryClient::with_transport(Environment::Production, Arc::new(DirectoryTransport));
+        let agent = Agent::with_clients(directory, Arc::new(Factory));
+
+        for (request, name) in [
+            (
+                FederatedSearchRequest {
+                    max_services: 101,
+                    ..FederatedSearchRequest::default()
+                },
+                "max_services",
+            ),
+            (
+                FederatedSearchRequest {
+                    max_offerings_per_service: 101,
+                    ..FederatedSearchRequest::default()
+                },
+                "max_offerings_per_service",
+            ),
+            (
+                FederatedSearchRequest {
+                    concurrency: 17,
+                    ..FederatedSearchRequest::default()
+                },
+                "concurrency",
+            ),
+        ] {
+            let error = agent
+                .search_offerings_across_services(&request)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(name), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn builds_an_agent_for_an_environment_it_keeps() {
+        let agent = Agent::new(Environment::Sandbox).unwrap();
+        assert_eq!(agent.environment(), Environment::Sandbox);
+    }
+
+    /// The default factory reaches the Service Origin the Directory listed.
+    #[test]
+    fn builds_a_default_client_for_a_listed_service() {
+        let service: DirectoryService = serde_json::from_str(
+            r#"{"description":"One","indexed_at":"2026-08-25T00:00:00Z","language":"en","localizations":["en"],"name":"One","operations":[],"service_origin":"https://plants.example"}"#,
+        )
+        .unwrap();
+        let client = DefaultServiceClientFactory.create(&service).unwrap();
+        assert_eq!(client.service_origin(), "https://plants.example");
+    }
+
+    /// A factory that records the URLs its clients are asked for.
+    #[derive(Default)]
+    struct RecordingFactory {
+        urls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingFactory {
+        fn urls(&self) -> Vec<String> {
+            self.urls.lock().unwrap().clone()
+        }
+    }
+
+    impl ServiceClientFactory for RecordingFactory {
+        fn create(&self, service: &DirectoryService) -> Result<ServiceClient, AgentError> {
+            ServiceClient::with_transport(
+                &service.service_origin,
+                Arc::new(RecordingTransport {
+                    urls: self.urls.clone(),
+                }),
+            )
+        }
+    }
+
+    struct RecordingTransport {
+        urls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Transport for RecordingTransport {
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+            self.urls.lock().unwrap().push(request.url.clone());
+            ServiceTransport.send(request).await
+        }
     }
 }

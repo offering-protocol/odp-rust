@@ -70,6 +70,7 @@ fn result(mut raw: Value) -> Result<DirectoryResult, DirectoryError> {
     let object = service
         .as_object_mut()
         .ok_or_else(|| invalid("service must be an object"))?;
+    let mut projection = object.clone();
     for name in [
         "branding",
         "http",
@@ -78,9 +79,9 @@ fn result(mut raw: Value) -> Result<DirectoryResult, DirectoryError> {
         "payment_origins",
         "search_capabilities",
     ] {
-        object.remove(name);
+        projection.remove(name);
     }
-    let mut document = Value::Object(object.clone());
+    let mut document = Value::Object(projection);
     document["odp_version"] = json!("1.0");
     document["http"] = json!({"endpoint_base":"/"});
     let parsed = parse_agent_service_document(&serde_json::to_vec(&document).map_err(invalid)?)

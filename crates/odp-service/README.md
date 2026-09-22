@@ -69,6 +69,16 @@ resources during construction, defaults pages to 50 resources, and issues statel
 protected against tampering. They expire after one hour. The Service request boundary caps every
 requested page at 100 resources.
 
+Individual Offering and Collection retrieval defaults to full representation; lists and searches
+default to terse. Search body limits are passed to the catalog and checked against its response.
+For search continuations on `/offerings/search` or `/collections/search`, implement
+`continue_offering_search` or `continue_collection_search`. These receive the opaque cursor in
+`CatalogRequest` without a fabricated search query. Their defaults return `CONTINUATION_EXPIRED`.
+
+`CatalogRequest.language` is the selected localization; `accept_language` retains the original
+header. Use `ServiceError::retry_after` for failures with retry timing, or `ServiceError::request`
+when no retry timing applies.
+
 The storage boundary can wrap an existing asynchronous repository without coupling ODP to its
 database:
 

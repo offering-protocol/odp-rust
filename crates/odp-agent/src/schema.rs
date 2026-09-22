@@ -11,7 +11,15 @@ const MAXIMUM_DEPTH: usize = 8;
 const MAXIMUM_DOCUMENT_BYTES: usize = 262_144;
 const MAXIMUM_DOCUMENTS: usize = 16;
 const MAXIMUM_GRAPH_BYTES: usize = 1_048_576;
-const STANDARD_VOCABULARY: &str = "https://json-schema.org/draft/2020-12/vocab/";
+const VOCABULARIES: &[&str] = &[
+    "core",
+    "applicator",
+    "unevaluated",
+    "validation",
+    "meta-data",
+    "format-annotation",
+    "content",
+];
 
 pub(crate) async fn resolve_schema(
     client: &ServiceClient,
@@ -37,27 +45,47 @@ pub(crate) async fn resolve_schema(
                 "ODP Attribute Schema graph exceeds eight reference levels".to_owned(),
             ));
         }
-        let document = client
-            .supporting_json(
+        let resource = client
+            .supporting_resource(
                 url.as_str(),
                 "attribute-schema",
                 "application/schema+json",
                 &["application/schema+json"],
                 MAXIMUM_DOCUMENT_BYTES,
+                client.cache_fallbacks().schema,
             )
             .await?;
+        let mut document = resource.value;
         require_schema(&document)?;
-        graph_bytes = graph_bytes.saturating_add(
-            serde_json::to_vec(&document)
-                .map_err(|error| AgentError::InvalidResponse(error.to_string()))?
-                .len(),
-        );
+        graph_bytes = graph_bytes.saturating_add(resource.bytes);
         if graph_bytes > MAXIMUM_GRAPH_BYTES {
             return Err(AgentError::InvalidResponse(
                 "ODP Attribute Schema graph exceeds its byte limit".to_owned(),
             ));
         }
-        for reference_url in schema_references(&document, &url)? {
+        let final_url = Url::parse(&resource.final_url)
+            .map_err(|error| AgentError::InvalidResponse(error.to_string()))?;
+        if let Some(object) = document.as_object_mut() {
+            if object.get("$id").is_some_and(|id| !id.is_string()) {
+                return Err(AgentError::InvalidResponse(
+                    "Schema $id must be a string".to_owned(),
+                ));
+            }
+            let identifier = object.get("$id").and_then(Value::as_str).unwrap_or("");
+            let identifier = final_url
+                .join(identifier)
+                .map_err(|error| AgentError::InvalidResponse(error.to_string()))?;
+            if identifier
+                .fragment()
+                .is_some_and(|fragment| !fragment.is_empty())
+            {
+                return Err(AgentError::InvalidResponse(
+                    "Schema $id must not contain a fragment".to_owned(),
+                ));
+            }
+            object.insert("$id".to_owned(), Value::String(identifier.to_string()));
+        }
+        for reference_url in schema_references(&document, &final_url)? {
             pending.push_back((reference_url, depth + 1));
         }
         documents.insert(url.to_string(), document);
@@ -90,7 +118,130 @@ pub(crate) async fn resolve_schema(
             .map(|value| validator.is_valid(&value))
             .unwrap_or(false)
     });
-    Ok((root.clone(), valid))
+    Ok((bundle(root, &documents)?, valid))
+}
+
+fn bundle(root: &Value, documents: &BTreeMap<String, Value>) -> Result<Value, AgentError> {
+    let mut bundled = root.clone();
+    let root_id = root.get("$id").and_then(Value::as_str).unwrap_or_default();
+    let aliases = documents
+        .iter()
+        .map(|(retrieval, value)| {
+            (
+                retrieval.clone(),
+                value
+                    .get("$id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(retrieval)
+                    .to_owned(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    rewrite_references(
+        &mut bundled,
+        &Url::parse(root_id).map_err(|error| AgentError::InvalidResponse(error.to_string()))?,
+        &aliases,
+    )?;
+    let object = bundled.as_object_mut().ok_or_else(|| {
+        AgentError::InvalidResponse("Attribute Schema must be an object".to_owned())
+    })?;
+    let definitions = object
+        .entry("$defs")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| AgentError::InvalidResponse("Schema $defs must be an object".to_owned()))?;
+    let mut resources = BTreeSet::from([root_id.to_owned()]);
+    for (retrieval_url, document) in documents {
+        let identifier = document
+            .get("$id")
+            .and_then(Value::as_str)
+            .unwrap_or(retrieval_url);
+        if resources.insert(identifier.to_owned()) {
+            let mut document = document.clone();
+            rewrite_references(
+                &mut document,
+                &Url::parse(identifier)
+                    .map_err(|error| AgentError::InvalidResponse(error.to_string()))?,
+                &aliases,
+            )?;
+            insert_definition(definitions, document);
+        }
+    }
+    Ok(bundled)
+}
+
+fn rewrite_references(
+    value: &mut Value,
+    base: &Url,
+    aliases: &BTreeMap<String, String>,
+) -> Result<(), AgentError> {
+    let Some(values) = value.as_object_mut() else {
+        return Ok(());
+    };
+    let base = match values.get("$id").and_then(Value::as_str) {
+        Some(id) => base
+            .join(id)
+            .map_err(|error| AgentError::InvalidResponse(error.to_string()))?,
+        None => base.clone(),
+    };
+    if let Some(reference) = values.get_mut("$ref") {
+        if let Some(text) = reference.as_str() {
+            let mut target = base
+                .join(text)
+                .map_err(|error| AgentError::InvalidResponse(error.to_string()))?;
+            let fragment = target.fragment().map(str::to_owned);
+            target.set_fragment(None);
+            if let Some(canonical) = aliases.get(target.as_str()) {
+                target = Url::parse(canonical)
+                    .map_err(|error| AgentError::InvalidResponse(error.to_string()))?;
+            }
+            target.set_fragment(fragment.as_deref());
+            *reference = Value::String(target.to_string());
+        }
+    }
+    for (name, child) in values {
+        match name.as_str() {
+            "$defs" | "properties" | "patternProperties" | "dependentSchemas" => {
+                if let Some(map) = child.as_object_mut() {
+                    for child in map.values_mut() {
+                        rewrite_references(child, &base, aliases)?;
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                if let Some(array) = child.as_array_mut() {
+                    for child in array {
+                        rewrite_references(child, &base, aliases)?;
+                    }
+                }
+            }
+            "not"
+            | "if"
+            | "then"
+            | "else"
+            | "items"
+            | "contains"
+            | "additionalProperties"
+            | "propertyNames"
+            | "unevaluatedItems"
+            | "unevaluatedProperties"
+            | "contentSchema" => rewrite_references(child, &base, aliases)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn insert_definition(definitions: &mut Map<String, Value>, value: Value) {
+    let mut index = definitions.len();
+    loop {
+        let name = format!("odp_resource_{index}");
+        if !definitions.contains_key(&name) {
+            definitions.insert(name, value);
+            return;
+        }
+        index += 1;
+    }
 }
 
 fn document_url(value: &str) -> Result<Url, AgentError> {
@@ -117,32 +268,32 @@ fn require_schema(document: &Value) -> Result<(), AgentError> {
     }
     let mut pending = vec![document];
     while let Some(value) = pending.pop() {
-        match value {
-            Value::Array(values) => pending.extend(values),
-            Value::Object(values) => {
-                if let Some(reference) = values.get("$dynamicRef") {
-                    if reference
-                        .as_str()
-                        .is_none_or(|reference| !reference.starts_with('#'))
-                    {
-                        return Err(AgentError::InvalidResponse(
-                            "ODP Attribute Schema $dynamicRef must be a fragment-only reference"
-                                .to_owned(),
-                        ));
-                    }
+        if let Value::Object(values) = value {
+            if let Some(reference) = values.get("$dynamicRef") {
+                if reference
+                    .as_str()
+                    .is_none_or(|reference| !reference.starts_with('#'))
+                {
+                    return Err(AgentError::InvalidResponse(
+                        "ODP Attribute Schema $dynamicRef must be a fragment-only reference"
+                            .to_owned(),
+                    ));
                 }
-                if let Some(vocabulary) = values.get("$vocabulary").and_then(Value::as_object) {
-                    for (url, required) in vocabulary {
-                        if required == &Value::Bool(true) && !url.starts_with(STANDARD_VOCABULARY) {
-                            return Err(AgentError::InvalidResponse(format!(
-                                "ODP Attribute Schema requires unsupported vocabulary {url}"
-                            )));
-                        }
-                    }
-                }
-                pending.extend(values.values());
             }
-            _ => {}
+            if let Some(vocabulary) = values.get("$vocabulary").and_then(Value::as_object) {
+                for (url, required) in vocabulary {
+                    if required == &Value::Bool(true)
+                        && !url
+                            .strip_prefix("https://json-schema.org/draft/2020-12/vocab/")
+                            .is_some_and(|name| VOCABULARIES.contains(&name))
+                    {
+                        return Err(AgentError::InvalidResponse(format!(
+                            "ODP Attribute Schema requires unsupported vocabulary {url}"
+                        )));
+                    }
+                }
+            }
+            pending.extend(subschemas(values));
         }
     }
     Ok(())
@@ -153,32 +304,62 @@ fn schema_references(document: &Value, retrieval_url: &Url) -> Result<Vec<Url>, 
     let mut local_resources = BTreeSet::from([retrieval_url.to_string()]);
     let mut pending = vec![(document, retrieval_url.clone())];
     while let Some((value, inherited_base)) = pending.pop() {
-        match value {
-            Value::Array(values) => {
-                pending.extend(values.iter().map(|value| (value, inherited_base.clone())));
+        if let Value::Object(values) = value {
+            let mut base = inherited_base;
+            if let Some(identifier) = values.get("$id").and_then(Value::as_str) {
+                base = base
+                    .join(identifier)
+                    .map_err(|error| AgentError::InvalidResponse(error.to_string()))?;
+                base.set_fragment(None);
+                local_resources.insert(base.to_string());
             }
-            Value::Object(values) => {
-                let mut base = inherited_base;
-                if let Some(identifier) = values.get("$id").and_then(Value::as_str) {
-                    base = base
-                        .join(identifier)
-                        .map_err(|error| AgentError::InvalidResponse(error.to_string()))?;
-                    base.set_fragment(None);
-                    local_resources.insert(base.to_string());
-                }
-                add_reference(values, "$ref", &base, &mut references)?;
-                pending.extend(
-                    values
-                        .iter()
-                        .filter(|(name, _)| *name != "$ref")
-                        .map(|(_, value)| (value, base.clone())),
-                );
-            }
-            _ => {}
+            add_reference(values, "$ref", &base, &mut references)?;
+            pending.extend(
+                subschemas(values)
+                    .into_iter()
+                    .map(|value| (value, base.clone())),
+            );
         }
     }
     references.retain(|reference| !local_resources.contains(reference.as_str()));
     Ok(references)
+}
+
+fn subschemas(values: &Map<String, Value>) -> Vec<&Value> {
+    let mut children = Vec::new();
+    for name in [
+        "$defs",
+        "properties",
+        "patternProperties",
+        "dependentSchemas",
+    ] {
+        if let Some(Value::Object(map)) = values.get(name) {
+            children.extend(map.values());
+        }
+    }
+    for name in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(Value::Array(array)) = values.get(name) {
+            children.extend(array);
+        }
+    }
+    for name in [
+        "not",
+        "if",
+        "then",
+        "else",
+        "items",
+        "contains",
+        "additionalProperties",
+        "propertyNames",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contentSchema",
+    ] {
+        if let Some(value) = values.get(name) {
+            children.push(value);
+        }
+    }
+    children
 }
 
 fn add_reference(
