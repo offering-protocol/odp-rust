@@ -28,6 +28,7 @@ cargo run -p odp-examples --bin odp-directory-discovery -- sandbox weather
 Use `production` instead of `sandbox` for production. Omit `weather` to browse rather than search.
 This example requires a deployment with `/v1/directory/search`. It requests at most five results,
 prints Service and Collection names, reports malformed or unknown results, and retrieves full
-Collection details only after inspecting the owning Service's advertised anonymous operation.
+Collection details only for ODP sources after inspecting the owning Service's advertised
+anonymous operation. Imported Collections print their exact document URL without ODP calls.
 It does not enroll, pay, or invoke Actions. Unlike `odp-agent-discovery`, it uses the real Directory,
 not a mock. The server's bounded result list is not an exhaustive catalog listing.

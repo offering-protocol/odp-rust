@@ -3,6 +3,7 @@
 mod client;
 mod models;
 mod results;
+mod sources;
 mod transport;
 
 pub use client::*;

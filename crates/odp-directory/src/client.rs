@@ -389,6 +389,10 @@ fn require_service_origin(value: Option<&Value>) -> Result<(), DirectoryError> {
     }
     let url =
         Url::parse(origin).map_err(|error| DirectoryError::InvalidResponse(error.to_string()))?;
+    require_public_host(&url)
+}
+
+pub(crate) fn require_public_host(url: &Url) -> Result<(), DirectoryError> {
     // An address literal is judged outright. A name is not resolved here: nothing is being
     // reached, and an Agent that later connects resolves and judges it again for itself.
     let reachable = match url.host() {
@@ -411,7 +415,7 @@ fn is_local_name(host: &str) -> bool {
 }
 
 /// An indexing time is an RFC 3339 timestamp, not whatever a date parser happens to accept.
-fn require_indexed_at(value: Option<&Value>) -> Result<(), DirectoryError> {
+pub(crate) fn require_indexed_at(value: Option<&Value>) -> Result<(), DirectoryError> {
     let indexed_at = value.and_then(Value::as_str).ok_or_else(|| {
         DirectoryError::InvalidResponse("Directory indexing time is missing".to_owned())
     })?;
@@ -628,6 +632,14 @@ fn validate_search(
     let Some(filters) = filters else {
         return Ok(());
     };
+    if let Some(sources) = &filters.sources {
+        if sources.is_empty() || sources.len() > 2 {
+            return Err(DirectoryError::InvalidRequest(
+                "sources must contain one or two distinct odp or openapi values".to_owned(),
+            ));
+        }
+        require_unique(sources, "sources")?;
+    }
     if filters.keywords.len() > 32
         || filters
             .keywords

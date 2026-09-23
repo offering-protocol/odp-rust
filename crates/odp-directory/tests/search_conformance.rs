@@ -149,6 +149,7 @@ async fn sends_a_request_it_accepts() {
                 keywords: vec!["plants".to_owned(), "seeds".to_owned()],
                 operations: vec![operation(Operation::GetOffering)],
                 payments: vec![payment(vec![PaymentOption::Card])],
+                sources: None,
                 trust: vec![TrustProtocol {
                     name: Protocol::Tap,
                 }],

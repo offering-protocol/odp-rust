@@ -13,7 +13,10 @@ for candidate Services, inspects each Service's live ODP document, and then navi
 that Service's Collections and Offerings.
 
 `DirectoryClient::search` discovers indexed Services and submitted Collections. Use
-`search_services` for a Service-only response or `collect_services` for bounded Service-only
+`service.source` to distinguish native ODP from imported OpenAPI documents and retain the exact
+discovery URL. Search and suggestions accept source filters. Imported Collections are Directory
+groups and must not be passed to ODP operations. Use
+`search_services` for a native ODP Service-only response or `collect_services` for bounded Service-only
 aggregation. `suggest` returns mixed target names; `suggest_services` returns Service-only
 keyword suggestions. See the [Directory guide](./crates/odp-directory/README.md) for result types,
 the 100-result cap, and migration from the earlier method names.

@@ -73,9 +73,11 @@ caller can use them without additional network access.
 
 ## Search across Services
 
-Federated discovery uses `DirectoryClient::collect_services` and remains Service-only. For mixed
-discovery, use `DirectoryClient::search`, inspect each Collection result's owning Service, then
-call `ServiceClient::get_collection` with its Collection ID. Collection results are not separate
+Federated discovery uses `DirectoryClient::collect_services` and remains native ODP Service-only.
+For mixed discovery, use `DirectoryClient::search`. When a Collection's
+`service.source.source_type` is `"odp"`, inspect its owning Service, then call
+`ServiceClient::get_collection` with its Collection ID. OpenAPI and unknown sources must not be
+passed to ODP operations; their Collection IDs identify Directory groups. Collection results are not separate
 Services. See the [Directory guide](../odp-directory/README.md#search-services-and-collections).
 
 ```rust,no_run

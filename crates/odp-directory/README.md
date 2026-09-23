@@ -55,7 +55,7 @@ let suggestions = directory
 # }
 ```
 
-`search_services` returns one Service-only response. `continue_search_services` follows one opaque
+`search_services` returns one native ODP Service-only response. `continue_search_services` follows one opaque
 `next` reference. `collect_services` performs bounded Service-only traversal, stopping at the
 response or item limit without fetching another response.
 Search filters cover keywords, ODP operations, enrollment protocols, payment protocols, payment
@@ -101,17 +101,70 @@ for issue in response.issues {
 `ResultType::Collection`. `None` selects both; explicit lists must be nonempty and distinct.
 Filters apply to the owning Service. An empty query is omitted, allowing browsing.
 
-Collection identity is its owning Service origin plus its case-sensitive Collection ID.
+Collection identity is its owning `service.service_id` plus its case-sensitive Collection ID.
+Several OpenAPI documents can share an API origin without being the same Directory Service.
 The result's `indexed_at` describes the Collection's freshness; `service.indexed_at` describes
-the parent's freshness. Both are timestamp strings. `service.service_id()` identifies the
+the parent's freshness. Both are timestamp strings. `service.service_id` identifies the
 Directory's Service record. Service results may include `available_through` platform attribution;
 Collection attribution is the owning `service` itself.
 
-Inspect the owning Service's live ODP document, then use the Agent client's `get_collection` to
-retrieve current details. Directory metadata is not authority to execute an Action or send
+For `service.source.source_type == "odp"`, inspect the owning Service's live ODP document, then
+use the Agent client's `get_collection` to retrieve current details. An OpenAPI Collection is a
+Directory presentation group, not an ODP operation target. Directory metadata is not authority to execute an Action or send
 credentials. Unknown future result types retain their full raw JSON and are not interpreted as
 Services. Malformed known results become indexed `issues` without discarding valid results.
 Additional fields are retained in `additional` maps.
+
+Mixed results use `DirectoryIndexedService`, separate from the native `DirectoryService` returned
+by `search_services`. Each mixed Service requires `service_id`, `service_origin`, `name`,
+`indexed_at` and `source`. Imported descriptions and languages are optional; missing lists become
+empty vectors. Imported results do not expose native ODP operations. Native results retain ODP
+validation. Unverified execution fields such as `http` and `payment_origins` are not returned.
+
+`DirectorySource` describes the document used for discovery:
+
+- `source_type` is `"odp"`, `"openapi"`, or an unknown future string. Unknown formats remain
+  readable but must not be passed to ODP operations.
+- `url` is the exact document URL, including path and query. It may differ from the API origin;
+  do not reconstruct it from `service_origin`.
+- `x402_discovery` records supporting fixed-path x402 discovery, not proof that an endpoint
+  accepts payments. Advertised evidence remains in `protocols`.
+
+The client does not fetch or execute OpenAPI documents.
+
+## Filter by source
+
+```rust,no_run
+use odp_directory::{DirectoryClient, Environment, ResourceSearchRequest, ServiceFilters, SourceType, SuggestionRequest};
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+let directory = DirectoryClient::new(Environment::Production)?;
+let filters = ServiceFilters {
+    sources: Some(vec![SourceType::Openapi]),
+    ..Default::default()
+};
+let results = directory.search(&ResourceSearchRequest {
+    filters: Some(filters.clone()),
+    query: "weather".to_owned(),
+    ..Default::default()
+}).await?;
+let names = directory.suggest(&SuggestionRequest {
+    filters: Some(filters),
+    prefix: "we".to_owned(),
+    ..Default::default()
+}).await?;
+# Ok(())
+# }
+```
+
+`sources: None` omits the filter. An explicit list must contain one or both distinct
+`SourceType::Odp` and `SourceType::Openapi` values. Sources are alternatives, combined with other
+filter categories using AND; Collections inherit the owning Service's source. Native
+`search_services` accepts the filter but remains ODP-only, so an OpenAPI-only filter yields no
+native matches. Unsupported source filter values are rejected during deserialization.
+
+## Mixed search bounds and suggestions
 
 Mixed search returns at most 100 results. `limit: 0` omits the limit, using the server's default
 of 100. The server does not currently offer continuation: absent `next` does not mean every match
@@ -121,7 +174,7 @@ a Service and two Collections count as three. Collection search does not depend 
 to display its card on the Directory landing page.
 
 `suggest` sends POST `/v1/directory/suggestions`. `SuggestionRequest.filters` accepts the same
-`ServiceFilters` as search, including AEP, keywords, ODP operations, payments and trust.
+`ServiceFilters` as search, including AEP, keywords, ODP operations, payments, sources and trust.
 Collection filters apply to their owning Service. Matching spans names, descriptions and keywords,
 but output contains deduplicated **names of matching Services and Collections**. Despite the
 argument name `prefix`, matching uses substrings and whitespace-separated alternative terms.
@@ -132,6 +185,12 @@ Both return strings from the server's `items` array; the default and maximum lim
 See the [canonical Directory example](../../examples/README.md#canonical-directory-discovery).
 
 ## Migration
+
+- Mixed result `service` fields use `DirectoryIndexedService`; its required `service_id` is a
+  field rather than an optional accessor. Native Service-only models are unchanged.
+- Explicit `ServiceFilters` literals include `sources: None` or `..Default::default()`.
+- Known mixed results require `source` metadata from the Directory. Missing sources are reported
+  as item issues, not assumed to be ODP.
 
 - Service-only `search` calls become `search_services`; `continue_search` calls become
   `continue_search_services`.

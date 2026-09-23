@@ -24,14 +24,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for result in response.items {
         match result {
             DirectoryResult::Service(item) => println!(
-                "Service: {} ({})",
-                item.service.name, item.service.service_origin
+                "Service: {} ({})\nDiscovery document: {}",
+                item.service.name, item.service.service_origin, item.service.source.url
             ),
             DirectoryResult::Collection(item) => {
                 println!(
                     "Collection: {} ({}, through {})",
                     item.collection.name, item.collection.id, item.service.service_origin
                 );
+                if item.service.source.source_type != "odp" {
+                    println!("Discovery document: {}", item.service.source.url);
+                    continue;
+                }
                 let client = ServiceClient::new(&item.service.service_origin)?;
                 let inspection = client.inspect().await?;
                 if inspection.document.operations.iter().any(|operation| {

@@ -42,7 +42,7 @@ EOF
 cat > "$consumer/src/main.rs" <<'EOF'
 use odp_agent::ServiceClient;
 use odp_core::{Representation, ResourceIdentity, ResourceType};
-use odp_directory::{DirectoryClient, Environment, ResourceSearchRequest, ResultType};
+use odp_directory::{DirectoryClient, DirectoryIndexedService, DirectorySource, Environment, ResourceSearchRequest, ResultType, ServiceFilters, SourceType};
 use odp_service::ServiceBuilder;
 
 fn main() {
@@ -54,11 +54,16 @@ fn main() {
     );
     let _ = DirectoryClient::new(Environment::Production);
     let _ = ResourceSearchRequest {
+        filters: Some(ServiceFilters {
+            sources: Some(vec![SourceType::Openapi]),
+            ..Default::default()
+        }),
         types: Some(vec![ResultType::Collection]),
         ..Default::default()
     };
     let _ = ServiceBuilder::new("Example", "Example Service", "en", "/odp");
     let _ = Representation::Terse;
+    let _: fn(&DirectoryIndexedService) -> &DirectorySource = |service| &service.source;
 }
 EOF
 

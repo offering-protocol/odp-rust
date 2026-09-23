@@ -33,6 +33,8 @@ pub struct ServiceFilters {
     pub operations: Vec<OperationFilter>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub payments: Vec<PaymentFilter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<SourceType>>,
     /// A trust filter is either empty or the single-item array `[{"name":"tap"}]`: `tap` is the
     /// only trust protocol this ODP version names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -76,6 +78,48 @@ pub enum ResultType {
     Collection,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceType {
+    Odp,
+    Openapi,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DirectorySource {
+    /// Unknown future formats remain readable but are not ODP capabilities.
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub url: String,
+    pub x402_discovery: bool,
+    #[serde(flatten)]
+    pub additional: AdditionalMembers,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DirectoryIndexedService {
+    pub description: Option<String>,
+    pub documentation_url: Option<String>,
+    pub indexed_at: String,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    pub language: Option<String>,
+    #[serde(default)]
+    pub localizations: Vec<String>,
+    pub name: String,
+    #[serde(default)]
+    pub operations: Vec<OperationDescriptor>,
+    pub protocols: Option<ServiceProtocols>,
+    pub service_id: String,
+    pub service_origin: String,
+    pub source: DirectorySource,
+    pub status_url: Option<String>,
+    pub support_url: Option<String>,
+    pub website_url: Option<String>,
+    #[serde(flatten)]
+    pub additional: AdditionalMembers,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ResourceSearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,7 +141,7 @@ pub enum DirectoryResult {
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ServiceResult {
-    pub service: DirectoryService,
+    pub service: DirectoryIndexedService,
     pub indexed_at: String,
     pub available_through: Option<ServiceReference>,
     #[serde(flatten)]
@@ -106,7 +150,7 @@ pub struct ServiceResult {
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct CollectionResult {
-    pub service: DirectoryService,
+    pub service: DirectoryIndexedService,
     pub indexed_at: String,
     pub collection: CollectionSummary,
     #[serde(flatten)]
