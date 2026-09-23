@@ -60,17 +60,17 @@ fn result(mut raw: Value) -> Result<DirectoryResult, DirectoryError> {
     if kind != "service" && kind != "collection" {
         return Ok(DirectoryResult::Unknown { kind, raw });
     }
-    text(&raw, "indexed_at", 64)?;
+    crate::client::require_indexed_at(raw.get("indexed_at"))?;
     let service = raw
         .get_mut("service")
         .ok_or_else(|| invalid("Missing service"))?;
     text(service, "service_id", 128)?;
     origin(service)?;
-    text(service, "indexed_at", 64)?;
+    crate::client::require_indexed_at(service.get("indexed_at"))?;
+    let source = crate::sources::read(service.get("source"))?;
     let object = service
         .as_object_mut()
         .ok_or_else(|| invalid("service must be an object"))?;
-    let mut projection = object.clone();
     for name in [
         "branding",
         "http",
@@ -79,8 +79,19 @@ fn result(mut raw: Value) -> Result<DirectoryResult, DirectoryError> {
         "payment_origins",
         "search_capabilities",
     ] {
-        projection.remove(name);
+        object.remove(name);
     }
+    if source.source_type == "odp" {
+        native_service(object)?;
+    } else {
+        crate::sources::imported_service(object)?;
+    }
+    finish_result(raw, &kind)
+}
+
+fn native_service(object: &mut serde_json::Map<String, Value>) -> Result<(), DirectoryError> {
+    let mut projection = object.clone();
+    projection.remove("source");
     let mut document = Value::Object(projection);
     document["odp_version"] = json!("1.0");
     document["http"] = json!({"endpoint_base":"/"});
@@ -98,6 +109,10 @@ fn result(mut raw: Value) -> Result<DirectoryResult, DirectoryError> {
     } else {
         object.remove("protocols");
     }
+    Ok(())
+}
+
+fn finish_result(mut raw: Value, kind: &str) -> Result<DirectoryResult, DirectoryError> {
     if kind == "service" {
         if let Some(reference) = raw.get("available_through") {
             text(reference, "service_id", 128)?;
@@ -148,7 +163,11 @@ fn origin(value: &Value) -> Result<(), DirectoryError> {
     Ok(())
 }
 
-fn text<'a>(value: &'a Value, field: &str, maximum: usize) -> Result<&'a str, DirectoryError> {
+pub(crate) fn text<'a>(
+    value: &'a Value,
+    field: &str,
+    maximum: usize,
+) -> Result<&'a str, DirectoryError> {
     value
         .get(field)
         .and_then(Value::as_str)
@@ -160,6 +179,6 @@ fn text<'a>(value: &'a Value, field: &str, maximum: usize) -> Result<&'a str, Di
         })
 }
 
-fn invalid(error: impl std::fmt::Display) -> DirectoryError {
+pub(crate) fn invalid(error: impl std::fmt::Display) -> DirectoryError {
     DirectoryError::InvalidResponse(error.to_string())
 }

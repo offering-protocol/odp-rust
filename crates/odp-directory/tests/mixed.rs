@@ -52,6 +52,7 @@ fn setup() -> (DirectoryClient, Arc<Stub>) {
 
 fn service() -> Value {
     json!({"service_id":"parent", "service_origin":"https://api.example.com",
+        "source":{"type":"odp","url":"https://api.example.com/.well-known/odp","x402_discovery":false},
         "indexed_at":"2026-09-18T11:00:00Z", "name":"Data", "description":"Data services.",
         "language":"en", "localizations":["en"], "operations":[
             {"name":"get-offering","authentication":"not-required"},
@@ -94,6 +95,373 @@ fn item(kind: &str) -> Value {
     item
 }
 
+fn imported(kind: &str) -> Value {
+    let mut value = item(kind);
+    let service = value["service"].as_object_mut().unwrap();
+    for key in [
+        "description",
+        "language",
+        "localizations",
+        "keywords",
+        "operations",
+        "protocols",
+    ] {
+        service.remove(key);
+    }
+    service.insert("source".to_owned(), json!({
+        "type":"openapi", "url":"https://docs.example/specs/api.json?version=3&key=a%2Fb", "x402_discovery":true
+    }));
+    value
+}
+
+#[tokio::test]
+async fn preserves_exact_sources_and_optional_metadata_without_odp_capabilities() {
+    let (client, stub) = setup();
+    let mut first = imported("service");
+    first["service"]["source"]["extra"] = json!({"retained":true});
+    for field in [
+        "operations",
+        "http",
+        "branding",
+        "mcp",
+        "odp_version",
+        "payment_origins",
+        "search_capabilities",
+    ] {
+        first["service"][field] = json!("not authoritative");
+    }
+    let mut future = imported("collection");
+    future["service"]["source"]["type"] = json!("future-format");
+    future["service"]["source"]["url"] = json!("HTTPS://Docs.Example:443/other.json?x=1");
+    future["service"]["service_id"] = json!("other-document");
+    future["service"]["description"] = json!("");
+    future["service"]["language"] = json!("en");
+    future["service"]["localizations"] = json!(["en"]);
+    future["service"]["keywords"] = json!(["weather"]);
+    for field in [
+        "documentation_url",
+        "status_url",
+        "support_url",
+        "website_url",
+    ] {
+        future["service"][field] = json!(format!("https://example.com/{field}"));
+    }
+    stub.ok(json!({"items":[first,imported("collection"),future]}));
+    let response = client
+        .continue_search("/v1/directory/search?cursor=opaque")
+        .await
+        .unwrap();
+    assert!(response.issues.is_empty(), "{:?}", response.issues);
+    let DirectoryResult::Service(first) = &response.items[0] else {
+        panic!("service")
+    };
+    assert_eq!(first.service.source.source_type, "openapi");
+    assert_eq!(
+        first.service.source.url,
+        "https://docs.example/specs/api.json?version=3&key=a%2Fb"
+    );
+    assert!(first.service.source.x402_discovery);
+    assert_eq!(
+        first.service.source.additional["extra"],
+        json!({"retained":true})
+    );
+    assert_eq!(
+        serde_json::to_value(&first.service.source).unwrap()["type"],
+        "openapi"
+    );
+    assert!(first.service.description.is_none());
+    assert!(first.service.language.is_none());
+    assert!(first.service.operations.is_empty());
+    assert!(first.service.localizations.is_empty());
+    assert!(first.service.keywords.is_empty());
+    assert!(first.service.protocols.is_none());
+    assert!(first.service.additional.is_empty());
+    let DirectoryResult::Collection(second) = &response.items[1] else {
+        panic!("collection")
+    };
+    let DirectoryResult::Collection(third) = &response.items[2] else {
+        panic!("collection")
+    };
+    assert_eq!(second.service.service_origin, third.service.service_origin);
+    assert_eq!(second.collection.id, third.collection.id);
+    assert_ne!(second.service.service_id, third.service.service_id);
+    assert_eq!(third.service.source.source_type, "future-format");
+    assert_eq!(
+        third.service.source.url,
+        "HTTPS://Docs.Example:443/other.json?x=1"
+    );
+    assert_eq!(third.service.description.as_deref(), Some(""));
+    assert_eq!(third.service.localizations, ["en"]);
+    assert_eq!(third.service.keywords, ["weather"]);
+    assert_eq!(
+        third.service.website_url.as_deref(),
+        Some("https://example.com/website_url")
+    );
+    assert_eq!(stub.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn isolates_invalid_sources_imported_metadata_and_native_records() {
+    let (client, stub) = setup();
+    let mut candidates = Vec::new();
+    for field in [
+        "source",
+        "name",
+        "service_id",
+        "service_origin",
+        "indexed_at",
+    ] {
+        let mut value = imported("service");
+        value["service"].as_object_mut().unwrap().remove(field);
+        candidates.push(value);
+    }
+    for field in ["type", "url", "x402_discovery"] {
+        for missing in [true, false] {
+            let mut value = imported("service");
+            if missing {
+                value["service"]["source"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+            } else {
+                value["service"]["source"][field] = Value::Null;
+            }
+            candidates.push(value);
+        }
+    }
+    for (field, invalid) in [
+        ("source", json!(null)),
+        ("source", json!([])),
+        ("name", json!(" ")),
+        ("indexed_at", json!("yesterday")),
+        ("localizations", json!([null])),
+        ("keywords", json!([12])),
+    ] {
+        let mut value = imported("service");
+        value["service"][field] = invalid;
+        candidates.push(value);
+    }
+    for field in [
+        "description",
+        "language",
+        "localizations",
+        "keywords",
+        "documentation_url",
+        "status_url",
+        "support_url",
+        "website_url",
+    ] {
+        for invalid in [Value::Null, json!(42)] {
+            let mut value = imported("service");
+            value["service"][field] = invalid;
+            candidates.push(value);
+        }
+    }
+    for url in [
+        "http://example.com/spec",
+        "/openapi.json",
+        "https:example.com/spec",
+        "https://user:secret@example.com/spec",
+        "https://example.com/spec#part",
+        "https://localhost/spec",
+        "https://127.0.0.1/spec",
+        "https://[::1]/spec",
+        "https://example.com:70000/spec",
+        "https://example.com/a\nb",
+        " ",
+        "https://[",
+    ] {
+        let mut value = imported("service");
+        value["service"]["source"]["url"] = json!(url);
+        candidates.push(value);
+    }
+    let mut invalid = imported("service");
+    invalid["service"]["source"]["x402_discovery"] = json!("false");
+    candidates.push(invalid);
+    for field in ["operations", "language", "source"] {
+        let mut native = item("service");
+        native["service"].as_object_mut().unwrap().remove(field);
+        candidates.push(native);
+    }
+    let count = candidates.len();
+    candidates.push(imported("service"));
+    candidates.push(item("service"));
+    stub.ok(json!({"items":candidates}));
+    let response = client
+        .search(&ResourceSearchRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(response.items.len(), 2, "{:?}", response.issues);
+    assert_eq!(
+        response
+            .issues
+            .iter()
+            .map(|issue| issue.index)
+            .collect::<Vec<_>>(),
+        (0..count).collect::<Vec<_>>()
+    );
+    stub.ok(json!({"items":[imported("service")["service"],service()]}));
+    let native = client
+        .search_services(&SearchRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(native.items.len(), 1);
+    assert_eq!(native.issues.len(), 1);
+}
+
+#[tokio::test]
+async fn validates_recognized_protocol_evidence_without_synthesizing_enrollment() {
+    let (client, stub) = setup();
+    let valid = json!({"payments":[{"name":"x402","authentication":"required","options":["base"]},{"name":"future"}], "trust":[{"name":"tap"},{"name":"future"}]});
+    let mut candidates = Vec::new();
+    for protocols in [
+        json!({}),
+        valid,
+        json!({"enrollment":[{"name":"aep"}]}),
+        json!({"payments":[{"name":"future"}]}),
+    ] {
+        let mut item = imported("service");
+        item["service"]["protocols"] = protocols;
+        candidates.push(item);
+    }
+    let valid_count = candidates.len();
+    for protocols in [
+        Value::Null,
+        json!([]),
+        json!({"trust":[]}),
+        json!({"trust":null}),
+        json!({"trust":[null]}),
+        json!({"trust":[{}]}),
+        json!({"trust":[{"name":"tap"},{"name":"tap"}]}),
+        json!({"enrollment":[{"name":"aep","extra":true}]}),
+        json!({"payments":[{"name":"x402"}]}),
+        json!({"payments":[{"name":"x402","authentication":"optional"}]}),
+        json!({"payments":[{"name":"x402","authentication":"required","options":["unknown"]}]}),
+    ] {
+        let mut item = imported("service");
+        item["service"]["protocols"] = protocols;
+        candidates.push(item);
+    }
+    let invalid_count = candidates.len() - valid_count;
+    stub.ok(json!({"items":candidates}));
+    let response = client
+        .search(&ResourceSearchRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(response.items.len(), valid_count, "{:?}", response.issues);
+    assert_eq!(response.issues.len(), invalid_count);
+    let DirectoryResult::Service(item) = &response.items[1] else {
+        panic!("service")
+    };
+    let protocols = item.service.protocols.as_ref().unwrap();
+    assert!(protocols.enrollment.is_empty());
+    assert_eq!(protocols.payments.len(), 1);
+    assert_eq!(
+        protocols.payments[0].options,
+        [odp_core::PaymentOption::Base]
+    );
+    assert_eq!(protocols.trust.len(), 1);
+}
+
+#[tokio::test]
+async fn sends_source_filters_on_all_supported_routes_and_rejects_empty_or_duplicate_filters() {
+    let (client, stub) = setup();
+    let filters = ServiceFilters {
+        sources: Some(vec![SourceType::Odp, SourceType::Openapi]),
+        keywords: vec!["weather".to_owned()],
+        ..Default::default()
+    };
+    let original = filters.clone();
+    stub.ok(json!({"items":[]}));
+    client
+        .search(&ResourceSearchRequest {
+            filters: Some(filters.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    stub.ok(json!({"items":[]}));
+    client
+        .search_services(&SearchRequest {
+            filters: Some(filters.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    stub.ok(json!({"items":["Weather"]}));
+    assert_eq!(
+        client
+            .suggest(&SuggestionRequest {
+                filters: Some(filters.clone()),
+                prefix: "we".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        ["Weather"]
+    );
+    assert_eq!(original, filters);
+    for sources in [
+        vec![],
+        vec![SourceType::Odp, SourceType::Odp],
+        vec![SourceType::Odp, SourceType::Openapi, SourceType::Odp],
+    ] {
+        let filters = ServiceFilters {
+            sources: Some(sources),
+            ..Default::default()
+        };
+        assert!(
+            client
+                .search(&ResourceSearchRequest {
+                    filters: Some(filters.clone()),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .search_services(&SearchRequest {
+                    filters: Some(filters.clone()),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .suggest(&SuggestionRequest {
+                    filters: Some(filters),
+                    prefix: "we".to_owned(),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+    }
+    for invalid in [json!(["future"]), json!(["ODP"]), json!([null])] {
+        assert!(serde_json::from_value::<ServiceFilters>(json!({"sources":invalid})).is_err());
+    }
+    let requests = stub.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for (request, path) in requests.iter().zip([
+        "/v1/directory/search",
+        "/v1/services/search",
+        "/v1/directory/suggestions",
+    ]) {
+        assert_eq!(request.url, format!("https://sandbox.inflowpay.ai{path}"));
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).unwrap()["filters"],
+            json!({"sources":["odp","openapi"],"keywords":["weather"]})
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(ServiceFilters::default()).unwrap(),
+        json!({})
+    );
+}
+
 #[tokio::test]
 async fn decodes_mixed_results_and_preserves_unknown_types() {
     let (client, stub) = setup();
@@ -113,7 +481,7 @@ async fn decodes_mixed_results_and_preserves_unknown_types() {
     let DirectoryResult::Service(service) = &response.items[0] else {
         panic!("service")
     };
-    assert_eq!(service.service.service_id(), Some("parent"));
+    assert_eq!(service.service.service_id, "parent");
     assert_eq!(
         service.available_through.as_ref().unwrap().name.as_deref(),
         Some("Platform")
@@ -185,10 +553,7 @@ async fn isolates_malformed_known_items_and_normalizes_future_operations() {
         panic!("collection")
     };
     assert_eq!(item.service.operations.len(), 2);
-    assert_eq!(
-        item.service.additional.get("http"),
-        Some(&json!({"endpoint_base":"https://untrusted.example"}))
-    );
+    assert!(!item.service.additional.contains_key("http"));
 }
 
 #[tokio::test]
