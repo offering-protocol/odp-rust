@@ -44,17 +44,17 @@ An Agent that searches the Directory and navigates Service catalogs uses:
 
 ```toml
 [dependencies]
-odp-agent = "0.1.1"
-odp-core = "0.1.1"
-odp-directory = "0.1.1"
+odp-agent = "0.2.0"
+odp-core = "0.2.0"
+odp-directory = "0.2.0"
 ```
 
 A Service that publishes its own catalog uses:
 
 ```toml
 [dependencies]
-odp-core = "0.1.1"
-odp-service = "0.1.1"
+odp-core = "0.2.0"
+odp-service = "0.2.0"
 ```
 
 Declare only the crates whose public types the application names. The individual crate guides
