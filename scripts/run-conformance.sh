@@ -3,7 +3,7 @@ set -eu
 
 specs_dir=${ODP_SPECS_DIR:-../odp-specs}
 output_dir=${ODP_CONFORMANCE_OUTPUT:-.conformance/reports}
-implementation_version=${ODP_RUST_VERSION:-0.1.1}
+implementation_version=${ODP_RUST_VERSION:-0.2.0}
 implementation_version=${implementation_version#v}
 adapter=target/debug/odp-conformance-adapter
 

@@ -15,7 +15,7 @@ readme = "README.md"
 
 [dependencies]
 async-trait.workspace = true
-odp-core = { version = "0.1.1", path = "../odp-core" }
+odp-core = { version = "0.2.0", path = "../odp-core" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
