@@ -105,7 +105,9 @@ Collection identity is its owning `service.service_id` plus its case-sensitive C
 Several OpenAPI documents can share an API origin without being the same Directory Service.
 The result's `indexed_at` describes the Collection's freshness; `service.indexed_at` describes
 the parent's freshness. Both are timestamp strings. `service.service_id` identifies the
-Directory's Service record. Service results may include `available_through` platform attribution;
+Directory's Service record. Service results may include optional `publisher` attribution with `publisher_id`, `name`,
+and `website_url`. The website is a display link, not a discovery or execution target.
+Omitted or null publisher attribution is accepted, and additional fields are preserved;
 Collection attribution is the owning `service` itself.
 
 For `service.source.source_type == "odp"`, inspect the owning Service's live ODP document, then

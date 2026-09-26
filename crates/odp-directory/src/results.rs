@@ -114,11 +114,18 @@ fn native_service(object: &mut serde_json::Map<String, Value>) -> Result<(), Dir
 
 fn finish_result(mut raw: Value, kind: &str) -> Result<DirectoryResult, DirectoryError> {
     if kind == "service" {
-        if let Some(reference) = raw.get("available_through") {
-            text(reference, "service_id", 128)?;
-            origin(reference)?;
-            if reference.get("name").is_some() {
-                text(reference, "name", 128)?;
+        if let Some(publisher) = raw.get("publisher").filter(|value| !value.is_null()) {
+            text(publisher, "publisher_id", 128)?;
+            text(publisher, "name", 128)?;
+            let website = url::Url::parse(text(publisher, "website_url", 512)?).map_err(invalid)?;
+            if website.scheme() != "https"
+                || website.host_str().is_none()
+                || !website.username().is_empty()
+                || website.password().is_some()
+            {
+                return Err(invalid(
+                    "Publisher website must be an HTTPS URL without credentials",
+                ));
             }
         }
         raw.as_object_mut()
