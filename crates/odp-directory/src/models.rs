@@ -143,7 +143,7 @@ pub enum DirectoryResult {
 pub struct ServiceResult {
     pub service: DirectoryIndexedService,
     pub indexed_at: String,
-    pub available_through: Option<ServiceReference>,
+    pub publisher: Option<Publisher>,
     #[serde(flatten)]
     pub additional: AdditionalMembers,
 }
@@ -158,10 +158,10 @@ pub struct CollectionResult {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-pub struct ServiceReference {
-    pub service_id: String,
-    pub service_origin: String,
-    pub name: Option<String>,
+pub struct Publisher {
+    pub publisher_id: String,
+    pub name: String,
+    pub website_url: String,
     #[serde(flatten)]
     pub additional: AdditionalMembers,
 }

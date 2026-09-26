@@ -466,7 +466,7 @@ async fn sends_source_filters_on_all_supported_routes_and_rejects_empty_or_dupli
 async fn decodes_mixed_results_and_preserves_unknown_types() {
     let (client, stub) = setup();
     let mut first = item("service");
-    first["available_through"] = json!({"service_id":"platform", "service_origin":"https://platform.example", "name":"Platform"});
+    first["publisher"] = json!({"publisher_id":"platform", "website_url":"https://platform.example/catalog", "name":"Platform", "extra":true});
     first["extra"] = json!(true);
     let future = json!({"type":"future","nested":{"data":42}});
     stub.ok(json!({"items":[first,item("collection"),future],"extra":42,
@@ -482,11 +482,16 @@ async fn decodes_mixed_results_and_preserves_unknown_types() {
         panic!("service")
     };
     assert_eq!(service.service.service_id, "parent");
-    assert_eq!(
-        service.available_through.as_ref().unwrap().name.as_deref(),
-        Some("Platform")
-    );
+    assert_eq!(service.publisher.as_ref().unwrap().name, "Platform");
     assert_eq!(service.additional["extra"], true);
+    assert_eq!(
+        service.publisher.as_ref().unwrap().additional["extra"],
+        true
+    );
+    assert_eq!(
+        service.publisher.as_ref().unwrap().website_url,
+        "https://platform.example/catalog"
+    );
     assert_eq!(service.service.protocols.as_ref().unwrap().trust.len(), 1);
     let DirectoryResult::Collection(collection) = &response.items[1] else {
         panic!("collection")
@@ -498,6 +503,56 @@ async fn decodes_mixed_results_and_preserves_unknown_types() {
     };
     assert_eq!(kind, "future");
     assert_eq!(raw, &future);
+}
+
+#[tokio::test]
+async fn publisher_metadata_is_optional_and_extensible() {
+    let (client, stub) = setup();
+    let mut first = item("service");
+    first["publisher"] = Value::Null;
+    first["available_through"] = json!({"service_id":"legacy"});
+    first["future_metadata"] = json!({"arbitrary":true});
+    stub.ok(json!({"items":[first,item("service")]}));
+    let response = client
+        .search(&ResourceSearchRequest::default())
+        .await
+        .unwrap();
+    assert!(response.issues.is_empty());
+    assert_eq!(response.items.len(), 2);
+    let DirectoryResult::Service(service) = &response.items[0] else {
+        panic!("service")
+    };
+    assert!(service.publisher.is_none());
+    assert_eq!(
+        service.additional["available_through"],
+        json!({"service_id":"legacy"})
+    );
+    assert_eq!(
+        service.additional["future_metadata"],
+        json!({"arbitrary":true})
+    );
+}
+
+#[tokio::test]
+async fn validates_publisher_websites() {
+    for address in [
+        "http://platform.example",
+        "https://user@platform.example",
+        "https://user:secret@platform.example",
+        "://invalid",
+    ] {
+        let (client, stub) = setup();
+        let mut first = item("service");
+        first["publisher"] =
+            json!({"publisher_id":"gateway","name":"Gateway","website_url":address});
+        stub.ok(json!({"items":[first,item("service")]}));
+        let response = client
+            .search(&ResourceSearchRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(response.issues.len(), 1);
+        assert_eq!(response.items.len(), 1);
+    }
 }
 
 #[tokio::test]
